@@ -151,12 +151,10 @@ sudo reboot
    sysctl net.ipv6.conf.all.forwarding
    ```
 
-3. Verify NAT rules:
-   ```bash
-   sudo iptables -t nat -L POSTROUTING -n -v
-   ```
-
 4. Try rebooting the server
+   ```bash
+   sudo reboot
+   ```
 
 ### Firewalld Conflicts
 
