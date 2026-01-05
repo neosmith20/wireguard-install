@@ -1,8 +1,8 @@
 #!/bin/bash
-# Secure WireGuard server installer (UFW-only edition)
-# Based on https://github.com/neosmith20/wireguard-install
-# Changes: UFW-only firewall, removed iptables/firewalld
-# Date: 2025-08-09
+# Secure WireGuard server installer (UFW edition)
+# Based on https://github.com/angristan/wireguard-install
+# Changes: UFW-only firewall with PostUp/PostDown commands
+# Date: 2025-01-04
 
 RED='\033[0;31m'
 ORANGE='\033[0;33m'
@@ -104,7 +104,7 @@ function initialCheck() {
 
 function installQuestions() {
   echo "Welcome to the WireGuard installer!"
-  echo "The git repository is available at: https://github.com/neosmith20/wireguard-install"
+  echo "The git repository is available at: https://github.com/angristan/wireguard-install"
   echo ""
   echo "I need to ask you a few questions before starting the setup."
   echo "You can keep the default options and just press enter if you are ok with them."
@@ -209,29 +209,19 @@ function installUfw() {
   echo -e "${GREEN}UFW installed successfully.${NC}"
 }
 
-function applyUfw() {
+function setupUfw() {
   local pub_nic="$1" wg_nic="$2" srv_port="$3" subnet_v4
   subnet_v4="$(echo "${SERVER_WG_IPV4}" | awk -F'.' '{print $1"."$2"."$3".0/24"}')"
 
-  echo -e "${ORANGE}Configuring UFW firewall rules...${NC}"
+  echo -e "${ORANGE}Configuring UFW firewall...${NC}"
 
-  # Disable UFW temporarily to modify configuration
-  ufw --force disable 2>/dev/null
-
-  # Reset UFW to default state (optional, but ensures clean config)
-  # Uncomment next line if you want to start fresh
-  # ufw --force reset
-
-  # Set default policies
-  ufw default deny incoming
-  ufw default allow outgoing
-  ufw default allow routed
+  # Set default policies (don't disable UFW, just configure it)
+  ufw --force default deny incoming
+  ufw --force default allow outgoing
+  ufw --force default allow routed
 
   # Allow SSH (important - don't lock yourself out!)
   ufw allow 22/tcp comment 'SSH access'
-
-  # Allow WireGuard UDP port
-  ufw allow "${srv_port}/udp" comment 'WireGuard VPN'
 
   # Enable forwarding in UFW
   sed -i 's|^DEFAULT_FORWARD_POLICY=.*|DEFAULT_FORWARD_POLICY="ACCEPT"|' /etc/default/ufw
@@ -258,10 +248,6 @@ function applyUfw() {
 COMMIT\
 ' /etc/ufw/before.rules
   fi
-
-  # Allow routing between WireGuard and public interface
-  ufw route allow in on "${wg_nic}" out on "${pub_nic}" comment 'WireGuard to Internet'
-  ufw route allow in on "${pub_nic}" out on "${wg_nic}" comment 'Internet to WireGuard'
 
   # Enable UFW
   echo -e "${ORANGE}Enabling UFW...${NC}"
@@ -350,14 +336,22 @@ CLIENT_DNS_1=${CLIENT_DNS_1}
 CLIENT_DNS_2=${CLIENT_DNS_2}
 ALLOWED_IPS=${ALLOWED_IPS}" >/etc/wireguard/params
 
-  # Server interface configuration (no PostUp/PostDown needed with UFW)
+  # Server interface configuration WITH PostUp/PostDown for UFW
   echo "[Interface]
 Address = ${SERVER_WG_IPV4}/24,${SERVER_WG_IPV6}/64
 ListenPort = ${SERVER_PORT}
-PrivateKey = ${SERVER_PRIV_KEY}" >"/etc/wireguard/${SERVER_WG_NIC}.conf"
+PrivateKey = ${SERVER_PRIV_KEY}
+PostUp = ufw allow in on ${SERVER_PUB_NIC} to any port ${SERVER_PORT} proto udp
+PostUp = ufw allow in on ${SERVER_WG_NIC}
+PostUp = ufw route allow in on ${SERVER_PUB_NIC} out on ${SERVER_WG_NIC}
+PostUp = ufw route allow in on ${SERVER_WG_NIC} out on ${SERVER_PUB_NIC}
+PostDown = ufw delete allow in on ${SERVER_PUB_NIC} to any port ${SERVER_PORT} proto udp
+PostDown = ufw delete allow in on ${SERVER_WG_NIC}
+PostDown = ufw route delete allow in on ${SERVER_PUB_NIC} out on ${SERVER_WG_NIC}
+PostDown = ufw route delete allow in on ${SERVER_WG_NIC} out on ${SERVER_PUB_NIC}" >"/etc/wireguard/${SERVER_WG_NIC}.conf"
 
-  # Apply UFW configuration
-  applyUfw "${SERVER_PUB_NIC}" "${SERVER_WG_NIC}" "${SERVER_PORT}"
+  # Setup UFW system configuration
+  setupUfw "${SERVER_PUB_NIC}" "${SERVER_WG_NIC}" "${SERVER_PORT}"
 
   # Enable routing on the server
   echo "net.ipv4.ip_forward = 1
@@ -574,23 +568,6 @@ function uninstallWg() {
       apk del wireguard-tools libqrencode libqrencode-tools
     fi
 
-    # Remove UFW (optional - uncomment if you want to remove UFW as well)
-    # echo -e "${ORANGE}Do you want to remove UFW as well? [y/n]:${NC}"
-    # read -rp "" REMOVE_UFW
-    # if [[ $REMOVE_UFW == 'y' ]]; then
-    #   if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' ]]; then
-    #     apt-get remove -y ufw
-    #   elif [[ ${OS} == 'fedora' ]]; then
-    #     dnf remove -y ufw
-    #   elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]] || [[ ${OS} == 'oracle' ]]; then
-    #     yum remove -y ufw
-    #   elif [[ ${OS} == 'arch' ]]; then
-    #     pacman -Rs --noconfirm ufw
-    #   elif [[ ${OS} == 'alpine' ]]; then
-    #     apk del ufw
-    #   fi
-    # fi
-
     # Remove configuration files
     rm -rf /etc/wireguard
     rm -f /etc/sysctl.d/wg.conf
@@ -627,7 +604,7 @@ function uninstallWg() {
 
 function manageMenu() {
   echo "Welcome to WireGuard-install!"
-  echo "The git repository is available at: https://github.com/neosmith20/wireguard-install"
+  echo "The git repository is available at: https://github.com/angristan/wireguard-install"
   echo ""
   echo "It looks like WireGuard is already installed."
   echo ""
