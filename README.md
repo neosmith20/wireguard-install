@@ -44,7 +44,7 @@ A secure and automated WireGuard VPN server installer that uses UFW (Uncomplicat
 
 1. **Download the script:**
    ```bash
-   wget https://raw.githubusercontent.com/YOUR_USERNAME/wireguard-install-ufw/main/wireguard-install-ufw.sh
+   wget https://raw.githubusercontent.com/neosmith20/wireguard-install/main/wireguard-install-ufw.sh
    chmod +x wireguard-install-ufw.sh
    ```
 
