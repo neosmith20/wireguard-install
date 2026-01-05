@@ -1,0 +1,660 @@
+#!/bin/bash
+# Secure WireGuard server installer (UFW-only edition)
+# Based on https://github.com/neosmith20/wireguard-install
+# Changes: UFW-only firewall, removed iptables/firewalld
+# Date: 2025-08-09
+
+RED='\033[0;31m'
+ORANGE='\033[0;33m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+function isRoot() {
+  if [ "${EUID}" -ne 0 ]; then
+    echo "You need to run this script as root"
+    exit 1
+  fi
+}
+
+function checkVirt() {
+  function openvzErr() {
+    echo "OpenVZ is not supported"
+    exit 1
+  }
+  function lxcErr() {
+    echo "LXC is not supported (yet)."
+    echo "WireGuard can technically run in an LXC container,"
+    echo "but the kernel module has to be installed on the host,"
+    echo "the container has to be run with some specific parameters"
+    echo "and only the tools need to be installed in the container."
+    exit 1
+  }
+  if command -v virt-what &>/dev/null; then
+    if [ "$(virt-what)" == "openvz" ]; then openvzErr; fi
+    if [ "$(virt-what)" == "lxc" ]; then lxcErr; fi
+  else
+    if [ "$(systemd-detect-virt)" == "openvz" ]; then openvzErr; fi
+    if [ "$(systemd-detect-virt)" == "lxc" ]; then lxcErr; fi
+  fi
+}
+
+function checkOS() {
+  source /etc/os-release
+  OS="${ID}"
+  if [[ ${OS} == "debian" || ${OS} == "raspbian" ]]; then
+    if [[ ${VERSION_ID} -lt 10 ]]; then
+      echo "Your version of Debian (${VERSION_ID}) is not supported."
+      echo "Please use Debian 10 Buster or later"
+      exit 1
+    fi
+    OS=debian # overwrite if raspbian
+  elif [[ ${OS} == "ubuntu" ]]; then
+    RELEASE_YEAR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
+    if [[ ${RELEASE_YEAR} -lt 18 ]]; then
+      echo "Your version of Ubuntu (${VERSION_ID}) is not supported. Please use Ubuntu 18.04 or later"
+      exit 1
+    fi
+  elif [[ ${OS} == "fedora" ]]; then
+    if [[ ${VERSION_ID} -lt 32 ]]; then
+      echo "Your version of Fedora (${VERSION_ID}) is not supported."
+      echo "Please use Fedora 32 or later"
+      exit 1
+    fi
+  elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
+    if [[ ${VERSION_ID} == 7* ]]; then
+      echo "Your version of CentOS (${VERSION_ID}) is not supported."
+      echo "Please use CentOS 8 or later"
+      exit 1
+    fi
+  elif [[ -e /etc/oracle-release ]]; then
+    source /etc/os-release
+    OS=oracle
+  elif [[ -e /etc/arch-release ]]; then
+    OS=arch
+  elif [[ -e /etc/alpine-release ]]; then
+    OS=alpine
+    if ! command -v virt-what &>/dev/null; then apk update && apk add virt-what; fi
+  else
+    echo "Looks like you aren't running this installer on a Debian, Ubuntu, Fedora, CentOS, AlmaLinux, Oracle or Arch Linux system"
+    exit 1
+  fi
+}
+
+function getHomeDirForClient() {
+  local CLIENT_NAME=$1
+  if [ -z "${CLIENT_NAME}" ]; then
+    echo "Error: getHomeDirForClient() requires a client name as argument"
+    exit 1
+  fi
+  if [ -e "/home/${CLIENT_NAME}" ]; then
+    HOME_DIR="/home/${CLIENT_NAME}"
+  elif [ "${SUDO_USER}" ]; then
+    if [ "${SUDO_USER}" == "root" ]; then HOME_DIR="/root"; else HOME_DIR="/home/${SUDO_USER}"; fi
+  else
+    HOME_DIR="/root"
+  fi
+  echo "$HOME_DIR"
+}
+
+function initialCheck() {
+  isRoot
+  checkOS
+  checkVirt
+}
+
+function installQuestions() {
+  echo "Welcome to the WireGuard installer!"
+  echo "The git repository is available at: https://github.com/neosmith20/wireguard-install"
+  echo ""
+  echo "I need to ask you a few questions before starting the setup."
+  echo "You can keep the default options and just press enter if you are ok with them."
+  echo ""
+
+  SERVER_PUB_IP=$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1)
+  if [[ -z ${SERVER_PUB_IP} ]]; then
+    SERVER_PUB_IP=$(ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1)
+  fi
+  read -rp "IPv4 or IPv6 public address: " -e -i "${SERVER_PUB_IP}" SERVER_PUB_IP
+
+  SERVER_NIC="$(ip -4 route ls | grep default | awk '/dev/ {for (i=1; i<=NF; i++) if ($i == "dev") print $(i+1)}' | head -1)"
+  until [[ ${SERVER_PUB_NIC} =~ ^[a-zA-Z0-9_]+$ ]]; do
+    read -rp "Public interface: " -e -i "${SERVER_NIC}" SERVER_PUB_NIC
+  done
+
+  until [[ ${SERVER_WG_NIC} =~ ^[a-zA-Z0-9_]+$ && ${#SERVER_WG_NIC} -lt 16 ]]; do
+    read -rp "WireGuard interface name: " -e -i wg0 SERVER_WG_NIC
+  done
+
+  until [[ ${SERVER_WG_IPV4} =~ ^([0-9]{1,3}\.){3} ]]; do
+    read -rp "Server WireGuard IPv4: " -e -i 10.66.66.1 SERVER_WG_IPV4
+  done
+
+  until [[ ${SERVER_WG_IPV6} =~ ^([a-f0-9]{1,4}:){3,4}: ]]; do
+    read -rp "Server WireGuard IPv6: " -e -i fd42:42:42::1 SERVER_WG_IPV6
+  done
+
+  RANDOM_PORT=$(shuf -i49152-65535 -n1)
+  until [[ ${SERVER_PORT} =~ ^[0-9]+$ ]] && [ "${SERVER_PORT}" -ge 1 ] && [ "${SERVER_PORT}" -le 65535 ]; do
+    read -rp "Server WireGuard port [1-65535]: " -e -i "${RANDOM_PORT}" SERVER_PORT
+  done
+
+  until [[ ${CLIENT_DNS_1} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
+    read -rp "First DNS resolver to use for the clients: " -e -i 1.1.1.1 CLIENT_DNS_1
+  done
+  until [[ ${CLIENT_DNS_2} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
+    read -rp "Second DNS resolver to use for the clients (optional): " -e -i 1.0.0.1 CLIENT_DNS_2
+    if [[ ${CLIENT_DNS_2} == "" ]]; then CLIENT_DNS_2="${CLIENT_DNS_1}"; fi
+  done
+
+  until [[ ${ALLOWED_IPS} =~ ^.+$ ]]; do
+    echo -e "\nWireGuard uses a parameter called AllowedIPs to determine what is routed over the VPN."
+    read -rp "Allowed IPs list for generated clients (leave default to route everything): " -e -i '0.0.0.0/0,::/0' ALLOWED_IPS
+    if [[ ${ALLOWED_IPS} == "" ]]; then ALLOWED_IPS="0.0.0.0/0,::/0"; fi
+  done
+
+  echo ""
+  echo "Okay, that was all I needed."
+  echo "We are ready to setup your WireGuard server now."
+  echo "You will be able to generate a client at the end of the installation."
+  read -n1 -r -p "Press any key to continue..."
+}
+
+function disableFirewalld() {
+  # Disable firewalld if it's running to prevent conflicts with UFW
+  if systemctl is-active --quiet firewalld 2>/dev/null; then
+    echo -e "${ORANGE}Detected firewalld is active. Disabling it to prevent conflicts with UFW...${NC}"
+    systemctl stop firewalld
+    systemctl disable firewalld
+    systemctl mask firewalld
+    echo -e "${GREEN}Firewalld has been disabled.${NC}"
+  fi
+}
+
+function installUfw() {
+  # Check if UFW is already installed
+  if command -v ufw >/dev/null 2>&1; then
+    echo -e "${GREEN}UFW is already installed.${NC}"
+    return 0
+  fi
+
+  echo -e "${ORANGE}Installing UFW...${NC}"
+  
+  # Install UFW based on distribution
+  if [[ ${OS} == 'ubuntu' || ${OS} == 'debian' ]]; then
+    apt-get update || { echo -e "${RED}Failed to update package lists${NC}"; exit 1; }
+    apt-get install -y ufw || { echo -e "${RED}Failed to install UFW${NC}"; exit 1; }
+  elif [[ ${OS} == 'arch' ]]; then
+    pacman -Sy --needed --noconfirm ufw || { echo -e "${RED}Failed to install UFW${NC}"; exit 1; }
+  elif [[ ${OS} == 'fedora' ]]; then
+    dnf install -y ufw || { echo -e "${RED}Failed to install UFW${NC}"; exit 1; }
+  elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
+    # Enable EPEL repository first for CentOS/RHEL-based systems
+    if ! rpm -q epel-release >/dev/null 2>&1; then
+      yum install -y epel-release || { echo -e "${RED}Failed to install EPEL repository${NC}"; exit 1; }
+    fi
+    yum install -y ufw || { echo -e "${RED}Failed to install UFW${NC}"; exit 1; }
+  elif [[ ${OS} == 'oracle' ]]; then
+    dnf install -y ufw || { echo -e "${RED}Failed to install UFW${NC}"; exit 1; }
+  elif [[ ${OS} == 'alpine' ]]; then
+    apk update || { echo -e "${RED}Failed to update package lists${NC}"; exit 1; }
+    apk add ufw || { echo -e "${RED}Failed to install UFW${NC}"; exit 1; }
+  fi
+
+  # Verify installation
+  if ! command -v ufw >/dev/null 2>&1; then
+    echo -e "${RED}UFW installation failed or UFW is not available for your system.${NC}"
+    exit 1
+  fi
+
+  echo -e "${GREEN}UFW installed successfully.${NC}"
+}
+
+function applyUfw() {
+  local pub_nic="$1" wg_nic="$2" srv_port="$3" subnet_v4
+  subnet_v4="$(echo "${SERVER_WG_IPV4}" | awk -F'.' '{print $1"."$2"."$3".0/24"}')"
+
+  echo -e "${ORANGE}Configuring UFW firewall rules...${NC}"
+
+  # Disable UFW temporarily to modify configuration
+  ufw --force disable 2>/dev/null
+
+  # Reset UFW to default state (optional, but ensures clean config)
+  # Uncomment next line if you want to start fresh
+  # ufw --force reset
+
+  # Set default policies
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw default allow routed
+
+  # Allow SSH (important - don't lock yourself out!)
+  ufw allow 22/tcp comment 'SSH access'
+
+  # Allow WireGuard UDP port
+  ufw allow "${srv_port}/udp" comment 'WireGuard VPN'
+
+  # Enable forwarding in UFW
+  sed -i 's|^DEFAULT_FORWARD_POLICY=.*|DEFAULT_FORWARD_POLICY="ACCEPT"|' /etc/default/ufw
+
+  # Enable IP forwarding in UFW's sysctl config
+  if [ -f /etc/ufw/sysctl.conf ]; then
+    sed -i 's|^#*net/ipv4/ip_forward=.*|net/ipv4/ip_forward=1|' /etc/ufw/sysctl.conf
+    sed -i 's|^#*net/ipv6/conf/all/forwarding=.*|net/ipv6/conf/all/forwarding=1|' /etc/ufw/sysctl.conf
+  fi
+
+  # Backup before.rules if not already backed up
+  if [ ! -f /etc/ufw/before.rules.bak ]; then
+    cp /etc/ufw/before.rules /etc/ufw/before.rules.bak
+  fi
+
+  # Add NAT rules to before.rules if not already present
+  if ! grep -q "# WireGuard NAT rules" /etc/ufw/before.rules 2>/dev/null; then
+    # Find the line with "Don't delete these required lines" and insert before COMMIT
+    sed -i '/^COMMIT$/i \
+# WireGuard NAT rules\
+*nat\
+:POSTROUTING ACCEPT [0:0]\
+-A POSTROUTING -s '"${subnet_v4}"' -o '"${pub_nic}"' -j MASQUERADE\
+COMMIT\
+' /etc/ufw/before.rules
+  fi
+
+  # Allow routing between WireGuard and public interface
+  ufw route allow in on "${wg_nic}" out on "${pub_nic}" comment 'WireGuard to Internet'
+  ufw route allow in on "${pub_nic}" out on "${wg_nic}" comment 'Internet to WireGuard'
+
+  # Enable UFW
+  echo -e "${ORANGE}Enabling UFW...${NC}"
+  ufw --force enable
+
+  # Enable UFW service to start on boot
+  if [[ ${OS} != 'alpine' ]]; then
+    systemctl enable ufw
+    systemctl start ufw
+  else
+    rc-update add ufw
+    rc-service ufw start
+  fi
+
+  # Show UFW status
+  echo -e "${GREEN}UFW Configuration Complete!${NC}"
+  echo ""
+  ufw status verbose
+}
+
+function installWireGuard() {
+  installQuestions
+
+  # Disable firewalld if present
+  disableFirewalld
+
+  # Install UFW first
+  installUfw
+
+  # Install WireGuard tools and helpers
+  if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' && ${VERSION_ID} -gt 10 ]]; then
+    apt-get update
+    apt-get install -y wireguard resolvconf qrencode
+  elif [[ ${OS} == 'debian' ]]; then
+    if ! grep -rqs "^deb .* buster-backports" /etc/apt/; then
+      echo "deb http://deb.debian.org/debian buster-backports main" >/etc/apt/sources.list.d/backports.list
+      apt-get update
+    fi
+    apt update
+    apt-get install -y resolvconf qrencode
+    apt-get install -y -t buster-backports wireguard
+  elif [[ ${OS} == 'fedora' ]]; then
+    if [[ ${VERSION_ID} -lt 32 ]]; then
+      dnf install -y dnf-plugins-core
+      dnf copr enable -y jdoss/wireguard
+      dnf install -y wireguard-dkms
+    fi
+    dnf install -y wireguard-tools qrencode
+  elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
+    if [[ ${VERSION_ID} == 8* ]]; then
+      yum install -y epel-release elrepo-release
+      yum install -y kmod-wireguard
+      yum install -y qrencode
+    fi
+    yum install -y wireguard-tools
+  elif [[ ${OS} == 'oracle' ]]; then
+    dnf install -y oraclelinux-developer-release-el8
+    dnf config-manager --disable -y ol8_developer
+    dnf config-manager --enable -y ol8_developer_UEKR6
+    dnf config-manager --save -y --setopt=ol8_developer_UEKR6.includepkgs='wireguard-tools*'
+    dnf install -y wireguard-tools qrencode
+  elif [[ ${OS} == 'arch' ]]; then
+    pacman -S --needed --noconfirm wireguard-tools qrencode
+  elif [[ ${OS} == 'alpine' ]]; then
+    apk update
+    apk add wireguard-tools libqrencode-tools
+  fi
+
+  # Directory & permissions
+  mkdir -p /etc/wireguard
+  chmod 600 -R /etc/wireguard/
+
+  SERVER_PRIV_KEY=$(wg genkey)
+  SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | wg pubkey)
+
+  # Save parameters
+  echo "SERVER_PUB_IP=${SERVER_PUB_IP}
+SERVER_PUB_NIC=${SERVER_PUB_NIC}
+SERVER_WG_NIC=${SERVER_WG_NIC}
+SERVER_WG_IPV4=${SERVER_WG_IPV4}
+SERVER_WG_IPV6=${SERVER_WG_IPV6}
+SERVER_PORT=${SERVER_PORT}
+SERVER_PRIV_KEY=${SERVER_PRIV_KEY}
+SERVER_PUB_KEY=${SERVER_PUB_KEY}
+CLIENT_DNS_1=${CLIENT_DNS_1}
+CLIENT_DNS_2=${CLIENT_DNS_2}
+ALLOWED_IPS=${ALLOWED_IPS}" >/etc/wireguard/params
+
+  # Server interface configuration (no PostUp/PostDown needed with UFW)
+  echo "[Interface]
+Address = ${SERVER_WG_IPV4}/24,${SERVER_WG_IPV6}/64
+ListenPort = ${SERVER_PORT}
+PrivateKey = ${SERVER_PRIV_KEY}" >"/etc/wireguard/${SERVER_WG_NIC}.conf"
+
+  # Apply UFW configuration
+  applyUfw "${SERVER_PUB_NIC}" "${SERVER_WG_NIC}" "${SERVER_PORT}"
+
+  # Enable routing on the server
+  echo "net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
+
+  sysctl --system
+
+  # Start and enable WireGuard
+  if [[ ${OS} == 'alpine' ]]; then
+    ln -s /etc/init.d/wg-quick "/etc/init.d/wg-quick.${SERVER_WG_NIC}"
+    rc-service "wg-quick.${SERVER_WG_NIC}" start
+    rc-update add "wg-quick.${SERVER_WG_NIC}"
+  else
+    systemctl start "wg-quick@${SERVER_WG_NIC}"
+    systemctl enable "wg-quick@${SERVER_WG_NIC}"
+  fi
+
+  newClient
+  echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
+
+  # Check if WireGuard is running
+  if [[ ${OS} == 'alpine' ]]; then
+    rc-service --quiet "wg-quick.${SERVER_WG_NIC}" status
+  else
+    systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"
+  fi
+  WG_RUNNING=$?
+
+  if [[ ${WG_RUNNING} -ne 0 ]]; then
+    echo -e "\n${RED}WARNING: WireGuard does not seem to be running.${NC}"
+    if [[ ${OS} == 'alpine' ]]; then
+      echo -e "${ORANGE}You can check if WireGuard is running with: rc-service wg-quick.${SERVER_WG_NIC} status${NC}"
+    else
+      echo -e "${ORANGE}You can check if WireGuard is running with: systemctl status wg-quick@${SERVER_WG_NIC}${NC}"
+    fi
+    echo -e "${ORANGE}If you get something like \"Cannot find device ${SERVER_WG_NIC}\", please reboot!${NC}"
+  else
+    echo -e "\n${GREEN}WireGuard is running.${NC}"
+    if [[ ${OS} == 'alpine' ]]; then
+      echo -e "${GREEN}You can check the status of WireGuard with: rc-service wg-quick.${SERVER_WG_NIC} status\n\n${NC}"
+    else
+      echo -e "${GREEN}You can check the status of WireGuard with: systemctl status wg-quick@${SERVER_WG_NIC}\n\n${NC}"
+    fi
+    echo -e "${ORANGE}If you don't have internet connectivity from your client, try to reboot the server.${NC}"
+  fi
+}
+
+function newClient() {
+  if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
+    if [[ ${SERVER_PUB_IP} != *"["* ]] || [[ ${SERVER_PUB_IP} != *"]"* ]]; then
+      SERVER_PUB_IP="[${SERVER_PUB_IP}]"
+    fi
+  fi
+  ENDPOINT="${SERVER_PUB_IP}:${SERVER_PORT}"
+
+  echo ""
+  echo "Client configuration"
+  echo ""
+  echo "The client name must consist of alphanumeric character(s)."
+  echo "It may also include underscores or dashes and can't exceed 15 chars."
+
+  until [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ && ${CLIENT_EXISTS} == '0' && ${#CLIENT_NAME} -lt 16 ]]; do
+    read -rp "Client name: " -e CLIENT_NAME
+    CLIENT_EXISTS=$(grep -c -E "^### Client ${CLIENT_NAME}\$" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+    if [[ ${CLIENT_EXISTS} != 0 ]]; then
+      echo ""
+      echo -e "${ORANGE}A client with the specified name was already created, please choose another name.${NC}"
+      echo ""
+    fi
+  done
+
+  for DOT_IP in {2..254}; do
+    DOT_EXISTS=$(grep -c "${SERVER_WG_IPV4::-1}${DOT_IP}" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+    if [[ ${DOT_EXISTS} == '0' ]]; then break; fi
+  done
+  if [[ ${DOT_EXISTS} == '1' ]]; then
+    echo ""
+    echo "The subnet configured supports only 253 clients."
+    exit 1
+  fi
+
+  BASE_IP=$(echo "$SERVER_WG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
+  until [[ ${IPV4_EXISTS} == '0' ]]; do
+    read -rp "Client WireGuard IPv4: ${BASE_IP}." -e -i "${DOT_IP}" DOT_IP
+    CLIENT_WG_IPV4="${BASE_IP}.${DOT_IP}"
+    IPV4_EXISTS=$(grep -c "$CLIENT_WG_IPV4/32" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+    if [[ ${IPV4_EXISTS} != 0 ]]; then
+      echo ""
+      echo -e "${ORANGE}A client with the specified IPv4 was already created, please choose another IPv4.${NC}"
+      echo ""
+    fi
+  done
+
+  BASE_IP=$(echo "$SERVER_WG_IPV6" | awk -F '::' '{ print $1 }')
+  until [[ ${IPV6_EXISTS} == '0' ]]; do
+    read -rp "Client WireGuard IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
+    CLIENT_WG_IPV6="${BASE_IP}::${DOT_IP}"
+    IPV6_EXISTS=$(grep -c "${CLIENT_WG_IPV6}/128" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+    if [[ ${IPV6_EXISTS} != 0 ]]; then
+      echo ""
+      echo -e "${ORANGE}A client with the specified IPv6 was already created, please choose another IPv6.${NC}"
+      echo ""
+    fi
+  done
+
+  CLIENT_PRIV_KEY=$(wg genkey)
+  CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | wg pubkey)
+  CLIENT_PRE_SHARED_KEY=$(wg genpsk)
+
+  HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
+
+  cat >"${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf" <<EOF
+[Interface]
+PrivateKey = ${CLIENT_PRIV_KEY}
+Address = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128
+DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
+
+[Peer]
+PublicKey = ${SERVER_PUB_KEY}
+PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+Endpoint = ${ENDPOINT}
+AllowedIPs = ${ALLOWED_IPS}
+EOF
+
+  echo -e "\n### Client ${CLIENT_NAME}
+[Peer]
+PublicKey = ${CLIENT_PUB_KEY}
+PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
+
+  wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
+
+  if command -v qrencode &>/dev/null; then
+    echo -e "${GREEN}\nHere is your client config file as a QR Code:\n${NC}"
+    qrencode -t ansiutf8 -l L <"${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
+    echo ""
+  fi
+  echo -e "${GREEN}Your client config file is in ${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf${NC}"
+}
+
+function listClients() {
+  NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+  if [[ ${NUMBER_OF_CLIENTS} -eq 0 ]]; then
+    echo ""
+    echo "You have no existing clients!"
+    exit 1
+  fi
+  grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | nl -s ') '
+}
+
+function revokeClient() {
+  NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+  if [[ ${NUMBER_OF_CLIENTS} == '0' ]]; then
+    echo ""
+    echo "You have no existing clients!"
+    exit 1
+  fi
+  echo ""
+  echo "Select the existing client you want to revoke"
+  grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | nl -s ') '
+  until [[ ${CLIENT_NUMBER} -ge 1 && ${CLIENT_NUMBER} -le ${NUMBER_OF_CLIENTS} ]]; do
+    if [[ ${CLIENT_NUMBER} == '1' ]]; then
+      read -rp "Select one client [1]: " CLIENT_NUMBER
+    else
+      read -rp "Select one client [1-${NUMBER_OF_CLIENTS}]: " CLIENT_NUMBER
+    fi
+  done
+  CLIENT_NAME=$(grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | sed -n "${CLIENT_NUMBER}"p)
+  sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/d" "/etc/wireguard/${SERVER_WG_NIC}.conf"
+  HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
+  rm -f "${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
+  wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
+  echo -e "${GREEN}Client ${CLIENT_NAME} revoked successfully.${NC}"
+}
+
+function uninstallWg() {
+  echo ""
+  echo -e "\n${RED}WARNING: This will uninstall WireGuard and remove all the configuration files!${NC}"
+  echo -e "${ORANGE}Please backup the /etc/wireguard directory if you want to keep your configuration files.\n${NC}"
+  read -rp "Do you really want to remove WireGuard? [y/n]: " -e REMOVE
+  REMOVE=${REMOVE:-n}
+  if [[ $REMOVE == 'y' ]]; then
+    checkOS
+    
+    # Stop WireGuard service
+    if [[ ${OS} == 'alpine' ]]; then
+      rc-service "wg-quick.${SERVER_WG_NIC}" stop
+      rc-update del "wg-quick.${SERVER_WG_NIC}"
+      unlink "/etc/init.d/wg-quick.${SERVER_WG_NIC}"
+    else
+      systemctl stop "wg-quick@${SERVER_WG_NIC}"
+      systemctl disable "wg-quick@${SERVER_WG_NIC}"
+    fi
+
+    # Remove WireGuard packages
+    if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' ]]; then
+      apt-get remove -y wireguard wireguard-tools qrencode
+    elif [[ ${OS} == 'fedora' ]]; then
+      dnf remove -y --noautoremove wireguard-tools qrencode
+      if [[ ${VERSION_ID} -lt 32 ]]; then
+        dnf remove -y --noautoremove wireguard-dkms
+        dnf copr disable -y jdoss/wireguard
+      fi
+    elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
+      yum remove -y --noautoremove wireguard-tools
+      if [[ ${VERSION_ID} == 8* ]]; then
+        yum remove --noautoremove kmod-wireguard qrencode
+      fi
+    elif [[ ${OS} == 'oracle' ]]; then
+      yum remove --noautoremove wireguard-tools qrencode
+    elif [[ ${OS} == 'arch' ]]; then
+      pacman -Rs --noconfirm wireguard-tools qrencode
+    elif [[ ${OS} == 'alpine' ]]; then
+      apk del wireguard-tools libqrencode libqrencode-tools
+    fi
+
+    # Remove UFW (optional - uncomment if you want to remove UFW as well)
+    # echo -e "${ORANGE}Do you want to remove UFW as well? [y/n]:${NC}"
+    # read -rp "" REMOVE_UFW
+    # if [[ $REMOVE_UFW == 'y' ]]; then
+    #   if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' ]]; then
+    #     apt-get remove -y ufw
+    #   elif [[ ${OS} == 'fedora' ]]; then
+    #     dnf remove -y ufw
+    #   elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]] || [[ ${OS} == 'oracle' ]]; then
+    #     yum remove -y ufw
+    #   elif [[ ${OS} == 'arch' ]]; then
+    #     pacman -Rs --noconfirm ufw
+    #   elif [[ ${OS} == 'alpine' ]]; then
+    #     apk del ufw
+    #   fi
+    # fi
+
+    # Remove configuration files
+    rm -rf /etc/wireguard
+    rm -f /etc/sysctl.d/wg.conf
+
+    # Restore before.rules backup if exists
+    if [ -f /etc/ufw/before.rules.bak ]; then
+      mv /etc/ufw/before.rules.bak /etc/ufw/before.rules
+      ufw reload
+    fi
+
+    # Reload sysctl
+    sysctl --system
+
+    # Check if WireGuard is still running
+    if [[ ${OS} == 'alpine' ]]; then
+      rc-service --quiet "wg-quick.${SERVER_WG_NIC}" status &>/dev/null
+    else
+      systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"
+    fi
+    WG_RUNNING=$?
+    
+    if [[ ${WG_RUNNING} -eq 0 ]]; then
+      echo -e "${RED}WireGuard failed to uninstall properly.${NC}"
+      exit 1
+    else
+      echo -e "${GREEN}WireGuard uninstalled successfully.${NC}"
+      exit 0
+    fi
+  else
+    echo ""
+    echo "Removal aborted!"
+  fi
+}
+
+function manageMenu() {
+  echo "Welcome to WireGuard-install!"
+  echo "The git repository is available at: https://github.com/neosmith20/wireguard-install"
+  echo ""
+  echo "It looks like WireGuard is already installed."
+  echo ""
+  echo "What do you want to do?"
+  echo " 1) Add a new user"
+  echo " 2) List all users"
+  echo " 3) Revoke existing user"
+  echo " 4) Uninstall WireGuard"
+  echo " 5) Exit"
+
+  until [[ ${MENU_OPTION} =~ ^[1-5]$ ]]; do
+    read -rp "Select an option [1-5]: " MENU_OPTION
+  done
+  case "${MENU_OPTION}" in
+    1) newClient ;;
+    2) listClients ;;
+    3) revokeClient ;;
+    4) uninstallWg ;;
+    5) exit 0 ;;
+  esac
+}
+
+# Main
+initialCheck
+if [[ -e /etc/wireguard/params ]]; then
+  source /etc/wireguard/params
+  manageMenu
+else
+  installWireGuard
+fi
