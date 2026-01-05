@@ -1,6 +1,6 @@
 #!/bin/bash
 # Secure WireGuard server installer (UFW edition)
-# Based on https://github.com/angristan/wireguard-install
+# Based on https://github.com/neosmith20/wireguard-install
 # Changes: UFW-only firewall with PostUp/PostDown commands
 # Date: 2025-01-04
 
@@ -104,7 +104,7 @@ function initialCheck() {
 
 function installQuestions() {
   echo "Welcome to the WireGuard installer!"
-  echo "The git repository is available at: https://github.com/angristan/wireguard-install"
+  echo "The git repository is available at: https://github.com/neosmith20/wireguard-install"
   echo ""
   echo "I need to ask you a few questions before starting the setup."
   echo "You can keep the default options and just press enter if you are ok with them."
@@ -232,24 +232,13 @@ function setupUfw() {
     sed -i 's|^#*net/ipv6/conf/all/forwarding=.*|net/ipv6/conf/all/forwarding=1|' /etc/ufw/sysctl.conf
   fi
 
-  # Backup before.rules if not already backed up
-  if [ ! -f /etc/ufw/before.rules.bak ]; then
-    cp /etc/ufw/before.rules /etc/ufw/before.rules.bak
-  fi
+  # NOTE:
+# We intentionally do NOT edit /etc/ufw/before.rules for NAT.
+# On iptables-nft systems, UFW before.rules NAT may not be applied reliably.
+# NAT is instead attached to WireGuard PostUp/PostDown so it exists ONLY while wg0 is up.
+#
+# Enable UFW
 
-  # Add NAT rules to before.rules if not already present
-  if ! grep -q "# WireGuard NAT rules" /etc/ufw/before.rules 2>/dev/null; then
-    # Find the line with "Don't delete these required lines" and insert before COMMIT
-    sed -i '/^COMMIT$/i \
-# WireGuard NAT rules\
-*nat\
-:POSTROUTING ACCEPT [0:0]\
--A POSTROUTING -s '"${subnet_v4}"' -o '"${pub_nic}"' -j MASQUERADE\
-COMMIT\
-' /etc/ufw/before.rules
-  fi
-
-  # Enable UFW
   echo -e "${ORANGE}Enabling UFW...${NC}"
   ufw --force enable
 
@@ -336,19 +325,29 @@ CLIENT_DNS_1=${CLIENT_DNS_1}
 CLIENT_DNS_2=${CLIENT_DNS_2}
 ALLOWED_IPS=${ALLOWED_IPS}" >/etc/wireguard/params
 
-  # Server interface configuration WITH PostUp/PostDown for UFW
+  # Server interface configuration WITH PostUp/PostDown (UFW + NAT)
+  WG_SUBNET_V4="$(echo "${SERVER_WG_IPV4}" | awk -F'.' '{print $1"."$2"."$3".0/24"}')"
+
   echo "[Interface]
 Address = ${SERVER_WG_IPV4}/24,${SERVER_WG_IPV6}/64
 ListenPort = ${SERVER_PORT}
 PrivateKey = ${SERVER_PRIV_KEY}
+
+# Allow WireGuard UDP port on public interface
 PostUp = ufw allow in on ${SERVER_PUB_NIC} to any port ${SERVER_PORT} proto udp
-PostUp = ufw allow in on ${SERVER_WG_NIC}
-PostUp = ufw route allow in on ${SERVER_PUB_NIC} out on ${SERVER_WG_NIC}
-PostUp = ufw route allow in on ${SERVER_WG_NIC} out on ${SERVER_PUB_NIC}
 PostDown = ufw delete allow in on ${SERVER_PUB_NIC} to any port ${SERVER_PORT} proto udp
+
+# Allow traffic entering the tunnel
+PostUp = ufw allow in on ${SERVER_WG_NIC}
 PostDown = ufw delete allow in on ${SERVER_WG_NIC}
-PostDown = ufw route delete allow in on ${SERVER_PUB_NIC} out on ${SERVER_WG_NIC}
-PostDown = ufw route delete allow in on ${SERVER_WG_NIC} out on ${SERVER_PUB_NIC}" >"/etc/wireguard/${SERVER_WG_NIC}.conf"
+
+# Allow routed traffic from VPN to internet
+PostUp = ufw route allow in on ${SERVER_WG_NIC} out on ${SERVER_PUB_NIC}
+PostDown = ufw route delete allow in on ${SERVER_WG_NIC} out on ${SERVER_PUB_NIC}
+
+# NAT (MASQUERADE) – required for client internet access
+PostUp = iptables -t nat -A POSTROUTING -s ${WG_SUBNET_V4} -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -s ${WG_SUBNET_V4} -o ${SERVER_PUB_NIC} -j MASQUERADE" >"/etc/wireguard/${SERVER_WG_NIC}.conf"
 
   # Setup UFW system configuration
   setupUfw "${SERVER_PUB_NIC}" "${SERVER_WG_NIC}" "${SERVER_PORT}"
@@ -604,7 +603,7 @@ function uninstallWg() {
 
 function manageMenu() {
   echo "Welcome to WireGuard-install!"
-  echo "The git repository is available at: https://github.com/angristan/wireguard-install"
+  echo "The git repository is available at: https://github.com/neosmith20/wireguard-install"
   echo ""
   echo "It looks like WireGuard is already installed."
   echo ""
