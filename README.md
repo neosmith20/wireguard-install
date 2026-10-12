@@ -1,245 +1,152 @@
-# WireGuard VPN Installer (UFW Edition)
+# WireGuard VPN Installer — UFW Edition
 
-A secure and automated WireGuard VPN server installer that uses UFW (Uncomplicated Firewall) exclusively for firewall management. This script simplifies the process of setting up a WireGuard VPN server on various Linux distributions.
+A Bash installer for a WireGuard VPN server using **UFW (Uncomplicated Firewall)** to manage firewall policy and persistent NAT configuration. It supports interactive setup, client management, a randomized private VPN subnet, and safety checks for existing host firewalls.
 
-## 🌟 Features
+> **Project status: v7.0 review candidate.** IPv4 connectivity, client management, firewall isolation, uninstall, and rollback have been exercised in an isolated Ubuntu 24.04 userspace-WireGuard test network. Native kernel WireGuard, real systemd/OpenRC boot persistence, full-tunnel IPv6, firewalld replacement, and package installation across every targeted distribution have **not** all been verified. Test on a disposable VM with console access before using a remote production server.
 
-- **UFW-Only Firewall**: Uses UFW exclusively, automatically disabling conflicting firewalls (firewalld)
-- **Multi-Distribution Support**: Works on Debian, Ubuntu, Fedora, CentOS, AlmaLinux, Rocky Linux, Oracle Linux, Arch Linux, and Alpine Linux
-- **Automated Setup**: Interactive installation with sensible defaults
-- **Client Management**: Easy client creation, listing, and revocation
-- **IPv4 & IPv6 Support**: Full dual-stack support with automatic forwarding configuration
-- **QR Code Generation**: Automatic QR code generation for easy mobile device setup
-- **Security First**: Uses pre-shared keys and modern WireGuard best practices
+## Features
 
-## 📋 Requirements
+- **Random subnet on first install:** chooses a collision-checked `10.x.y.0/24` network, records it, and assigns client IPs sequentially (starting at `.2`).
+- **UFW-managed firewall:** default-deny incoming/routed policies on new UFW setups, with explicit WireGuard transit rules.
+- **Protected destinations:** blocks VPN forwarding to `169.254.0.0/16` (including common cloud metadata addresses); private LAN and host-service access are denied by default, with explicit options.
+- **DNS handling:** accepts two IPv4 resolvers, can allow narrow TCP/UDP 53 exceptions for private resolvers, and adds required DNS host routes to split-tunnel client configs (without routing a matching endpoint IP into itself).
+- **IPv6 choices:** optional IPv6 egress using NAT66 on suitable hosts; for IPv4 full tunnels without IPv6 egress, attempts to route client IPv6 into the tunnel and block it. IPv6 behavior still needs native end-to-end testing.
+- **Client lifecycle:** add, list, and revoke peers; generate QR codes when `qrencode` is installed; synchronize peers without intentionally disrupting other clients.
+- **Safer changes:** SSH-port protection before activating previously inactive UFW, explicit confirmations, firewall snapshots and attempted rollback on installation failure.
+- **Tagged NAT:** installer-owned masquerade rules are identified by comments, so cleanup can preserve an otherwise identical administrator-created rule.
 
-### Supported Operating Systems
+UFW owns the firewall configuration, but the script **does use `iptables`/`ip6tables`** to check and remove its *tagged live NAT entries*. It does not add WireGuard `PostUp`/`PostDown` firewall commands.
 
-- **Debian**: 10 (Buster) or later
-- **Ubuntu**: 18.04 or later
-- **Fedora**: 32 or later
-- **CentOS**: 8 or later
-- **AlmaLinux**: 8 or later
-- **Rocky Linux**: 8 or later
-- **Oracle Linux**: 8 or later
-- **Arch Linux**: Latest
-- **Alpine Linux**: Latest
+## Targeted Linux distributions
 
-### System Requirements
+| Distribution | Targeted versions | Notes |
+| --- | --- | --- |
+| Ubuntu | 18.04 or newer | Older kernels may need matching headers/DKMS support; retired releases need maintained or archived repos |
+| Debian | 10 or newer | Debian 10 requires administrator-configured archived Buster backports and compatible kernel support |
+| Fedora | 32 or newer | Uses DNF |
+| AlmaLinux | 8 or newer | UFW may require EPEL; kernel module availability varies |
+| Rocky Linux | 8 or newer | UFW may require EPEL; kernel module availability varies |
+| CentOS Stream | 8 or newer | Retired versions require working repos; UFW may require EPEL |
+| Oracle Linux | 8 or newer | EPEL availability and kernel module depend on the host |
+| Arch Linux | Rolling release | Requires a supported kernel; uses Pacman and systemd |
+| Alpine Linux | Supported releases with required packages | Install Bash first; requires `wireguard-tools-openrc`/`ufw-openrc` and OpenRC |
 
-- Root access or sudo privileges
-- A fresh server with a public IP address
-- At least 512 MB RAM (1 GB recommended)
-- A virtualization environment that supports WireGuard (OpenVZ and standard LXC are not supported)
+**Targeted does not mean tested on every version.** The script checks for a usable WireGuard kernel driver and permission to create an interface before editing firewall configuration. Containers without the necessary kernel support or privileges will fail that preflight. It does not automatically repair end-of-life package repositories or install third-party kernel module repositories.
 
-### Network Requirements
+## Before you install
 
-- UDP port for WireGuard (default: random port between 49152-65535)
-- SSH access (port 22) should remain open
+- Use a **disposable VM or host with out-of-band/console access** for the first live test. Back up existing UFW and network settings.
+- You need root privileges, suitable package repositories, a working WireGuard kernel driver, and a network interface with IPv4 connectivity.
+- Ensure the selected UDP listening port is reachable externally, including router port forwarding or cloud-provider firewall rules as applicable.
+- Review SSH ports carefully. The installer detects an existing SSH connection or `sshd` configuration where possible and asks which TCP port(s) to protect.
+- If **firewalld** is active, the installer displays existing zones/services/ports, requires an explicit replacement confirmation, enables UFW first, and then disables firewalld. **It does not automatically migrate other allowed services.** Prepare equivalent UFW allowances before switching.
+- The installer refuses to proceed while a separately managed `nftables` service is active.
+- Activating UFW or enabling IPv6 filtering can affect unrelated host services. The installer asks for confirmation but cannot guarantee against remote lockout.
 
-## 🚀 Installation & Usage
+## Install
 
-### Quick Start
-
-1. **Download the script:**
-   ```bash
-   wget https://raw.githubusercontent.com/neosmith20/wireguard-install/main/wireguard-install-ufw.sh
-   chmod +x wireguard-install-ufw.sh
-   ```
-
-2. **Run the installer as root:**
-   ```bash
-   sudo ./wireguard-install-ufw.sh
-   ```
-
-3. **Follow the interactive prompts:**
-   - Confirm your server's public IP address
-   - Select your public network interface
-   - Choose a WireGuard interface name (default: wg0)
-   - Set WireGuard IPv4 and IPv6 addresses
-   - Choose a UDP port (or use the randomly generated one)
-   - Configure DNS resolvers for clients
-   - Set allowed IPs (default routes all traffic through VPN)
-
-4. **Create your first client:**
-   - The script will automatically prompt you to create your first client
-   - Enter a client name (alphanumeric, dashes, or underscores only)
-   - The script will generate a configuration file and QR code
-
-5. **Get your client configuration:**
-   - Configuration file location: `/root/wg0-client-CLIENTNAME.conf`
-   - Scan the QR code with your mobile device's WireGuard app, or
-   - Copy the configuration file to your client device
-
-### Managing Clients
-
-After installation, run the script again to access the management menu:
+Download and **review** the script before running it:
 
 ```bash
-sudo ./wireguard-install-ufw.sh
+wget https://raw.githubusercontent.com/neosmith20/wireguard-install/main/wireguard-install-ufw.sh
+less wireguard-install-ufw.sh
+sudo bash wireguard-install-ufw.sh
 ```
 
-**Available Options:**
-- **Add a new client**: Create additional VPN client configurations
-- **List all clients**: View all configured clients
-- **Revoke a client**: Remove a client's access to the VPN
-- **Uninstall WireGuard**: Completely remove WireGuard and all configurations
-- **Exit**: Close the management menu
+The installer prompts for the outgoing interface, public endpoint address/hostname, WireGuard interface (default `wg0`), UDP port, first-run `10.x.y.0/24` subnet, two IPv4 DNS resolvers, client `AllowedIPs`, LAN and server-service access, IPv6 mode, and SSH protection.
 
-## 🔧 Configuration Details
+Default client IPv4 `AllowedIPs` is `0.0.0.0/0` (full tunnel). For a split tunnel, enter the intended IPv4 CIDRs instead. Private-LAN forwarding is blocked unless explicitly enabled; permitting LAN access also requires valid routes and a return path outside the installer.
 
-### Firewall Configuration
+### IPv6 behavior
 
-The script automatically configures UFW with the following rules:
+- **IPv6 egress available and enabled:** configures ULA client addresses and IPv6 NAT66.
+- **Full-tunnel IPv4 without enabled IPv6 egress:** configures an IPv6 tunnel route and UFW block mode to avoid intentionally leaving IPv6 outside the VPN. The host must have IPv6 kernel support even if it has no public IPv6 route.
+- **Split-tunnel IPv4 without enabled IPv6 egress:** leaves client IPv6 to the client's normal network.
 
-- **Default Policies:**
-  - Incoming: DENY
-  - Outgoing: ALLOW
-  - Routed: ALLOW
+The IPv6 paths have not received the same live end-to-end coverage as the IPv4 split-tunnel path. Do not assume IPv6 leak protection is verified on every client OS.
 
-- **Allowed Ports:**
-  - SSH (22/tcp)
-  - WireGuard (your chosen UDP port)
+## Client configuration and management
 
-- **NAT & Routing:**
-  - MASQUERADE rules for VPN subnet
-  - Forwarding between WireGuard and public interfaces
-  - IPv4 and IPv6 forwarding enabled
-
-### WireGuard Configuration
-
-- **Server Config Location:** `/etc/wireguard/wg0.conf`
-- **Client Configs Location:** `/root/wg0-client-CLIENTNAME.conf`
-- **Parameters File:** `/etc/wireguard/params`
-
-### IP Forwarding
-
-The script enables IP forwarding in two locations:
-- `/etc/ufw/sysctl.conf`
-- `/etc/sysctl.d/wg.conf`
-
-Both IPv4 and IPv6 forwarding are enabled.
-
-## 🛠️ Troubleshooting
-
-### WireGuard Not Starting
-
-If WireGuard doesn't start after installation:
+After installation, the script offers to create the first client. Run the same script again for the management menu:
 
 ```bash
-# Check WireGuard status
-sudo systemctl status wg-quick@wg0
-
-# Check for errors
-sudo journalctl -u wg-quick@wg0
-
-# Try rebooting the server
-sudo reboot
+sudo bash wireguard-install-ufw.sh
 ```
 
-### No Internet on Client
+| Option | Action |
+| --- | --- |
+| 1 | Add client |
+| 2 | List clients |
+| 3 | Revoke client (requires typing `REVOKE`) |
+| 4 | Uninstall this managed WireGuard server (requires typing `UNINSTALL`) |
+| 5 | Exit |
 
-1. Verify UFW is active and rules are loaded:
-   ```bash
-   sudo ufw status verbose
-   ```
+- **Server config:** `/etc/wireguard/<interface>.conf` (e.g. `/etc/wireguard/wg0.conf`)
+- **Client configs:** `/etc/wireguard/clients/<name>.conf`
+- **Installer state:** `/etc/wireguard/ufw-installer.state`
+- **Managed forwarding config:** `/etc/sysctl.d/99-z-wg-ufw-installer.conf`
+- **UFW NAT files:** `/etc/ufw/before.rules` and, if IPv6 NAT66 is enabled, `/etc/ufw/before6.rules`
 
-2. Check IP forwarding is enabled:
-   ```bash
-   sysctl net.ipv4.ip_forward
-   sysctl net.ipv6.conf.all.forwarding
-   ```
+Installer-created client files contain **private keys and preshared keys** and are kept root-readable only. Treat QR codes as sensitive secrets as well. Securely transfer the config to the device; import it using a WireGuard-compatible client.
 
-4. Try rebooting the server
-   ```bash
-   sudo reboot
-   ```
+## Firewall behavior
 
-### Firewalld Conflicts
+On a newly enabled UFW installation, the installer sets **deny incoming**, **allow outgoing**, and **deny routed**, then applies scoped exceptions. On an already-active UFW installation, it preserves the existing incoming/outgoing defaults but may change an overly permissive routed default **after confirmation**.
 
-The script automatically detects and disables firewalld. If you experience issues:
+Typical installer-managed policy:
+
+- Allow the chosen WireGuard UDP listening port on the selected public interface.
+- Allow WireGuard-client forwarding through the specified outbound interface.
+- Deny routed traffic toward the cloud metadata/link-local IPv4 range.
+- Deny private IPv4 ranges (RFC1918 and CGNAT) unless LAN access is enabled; optionally permit selected private DNS resolvers on TCP/UDP 53 only.
+- Deny access from VPN clients to server-hosted services by default; optionally allow all host services or only configured host DNS (TCP/UDP 53).
+- Apply IPv6 forwarding, NAT66, or block rules according to the selected IPv6 mode.
+
+IPv4 NAT is stored in UFW's `before.rules`, tagged with an installer-specific comment. Because UFW reloads can duplicate live NAT entries, v7 removes **only its own tagged entries** on uninstall/rollback.
+
+## Uninstall and existing installations
+
+Use menu option **4** to stop the managed WireGuard service and remove its tracked peers, UFW rules, tagged NAT entries, configuration, and persistent forwarding file.
+
+Uninstall **does not** automatically uninstall shared OS packages, disable UFW, remove SSH safety rules, restore firewalld, or reset all global firewall/forwarding policies; these may be used by other services. Review them yourself afterward. If the installer changed UFW's global IPv6 setting, restoring the earlier setting is offered separately with a warning.
+
+**Version compatibility:** v7 still uses installer state schema `4`, but v7's tagged NAT cleanup does **not** recognize the untagged NAT entries written by v6.1 and earlier. If you installed with v6.1 or an earlier revision, **uninstall with that same version first**, rather than assuming v7 will fully clean it up. v3 state is not automatically migrated.
+
+## Troubleshooting
+
+Inspect the service, WireGuard handshake, firewall, and selected route:
 
 ```bash
-# Manually stop and disable firewalld
-sudo systemctl stop firewalld
-sudo systemctl disable firewalld
-sudo systemctl mask firewalld
-
-# Restart UFW
-sudo systemctl restart ufw
+sudo wg show
+sudo ufw status verbose
+ip -4 route
+sysctl net.ipv4.ip_forward
+sudo systemctl status wg-quick@wg0   # systemd distributions; replace wg0 if needed
+sudo journalctl -u wg-quick@wg0 -b --no-pager
 ```
 
-## 📱 Client Setup
+On Alpine/OpenRC, inspect `rc-service wg-quick.wg0 status` instead of `systemctl`.
 
-### Mobile Devices (iOS/Android)
+For clients with a handshake but no internet, check UDP reachability, configured `AllowedIPs`, DNS resolution, UFW forwarding rules, tagged NAT entries, and external provider/router firewall rules. When private LAN access is enabled, confirm a working route and return path. For full-tunnel IPv6, check the selected IPv6 mode and test traffic rather than assuming support.
 
-1. Install the WireGuard app from your device's app store
-2. Tap the "+" button
-3. Select "Create from QR code"
-4. Scan the QR code displayed after client creation
+If an installation fails, inspect the rollback output before disconnecting. The installer may retain recovery snapshots under `/root/.wgufw-install-backup.*` if rollback is incomplete.
 
-### Desktop/Laptop
+## Testing status
 
-1. Install WireGuard for your operating system from [wireguard.com](https://www.wireguard.com/install/)
-2. Copy the client configuration file to your device
-3. Import the configuration into WireGuard
-4. Activate the tunnel
+| Area | Status |
+| --- | --- |
+| ShellCheck, shfmt, Bash syntax | Reported clean for v7 during independent review |
+| IPv4 test tunnel, client handshake and NAT | Tested in disposable Ubuntu 24.04 environment with **userspace WireGuard** |
+| Private-LAN, cloud-metadata, host access and DNS exceptions | Tested in isolated network |
+| Client creation, revocation, uninstall and rollback | Tested in isolated network |
+| Native WireGuard kernel + real systemd services/reboot | **Not yet verified end to end** |
+| IPv6 full tunnel / NAT66 / leak-blocking | **Not yet verified end to end** |
+| Active firewalld replacement and package installs on other distros | **Not yet verified end to end** |
 
-## 🔒 Security Notes
+The isolated test environment used test-only substitutions for the missing kernel WireGuard driver and systemd service. **Those substitutions are not part of the published installer.**
 
-- All client configurations use pre-shared keys for additional security
-- Keep your `/etc/wireguard/` directory secure (permissions are set to 600 by default)
-- Regularly update your system and WireGuard packages
-- Use strong, unique client names
-- Revoke access for unused clients promptly
+## License and acknowledgments
 
-## 📝 Uninstallation
+MIT licensed; see [LICENSE](LICENSE) and the copyright notices retained in the installer. This project is derived from and inspired by [angristan/wireguard-install](https://github.com/angristan/wireguard-install).
 
-To completely remove WireGuard:
-
-```bash
-sudo ./wireguard-install-ufw.sh
-```
-
-Select option **4) Uninstall WireGuard** from the menu.
-
-**Warning:** This will remove all WireGuard configurations and client files. Back up `/etc/wireguard/` before uninstalling if you want to keep your configurations.
-
-## 🙏 Acknowledgments
-
-This project is based on the excellent work by [**angristan**](https://github.com/angristan) and their [wireguard-install](https://github.com/angristan/wireguard-install) script.
-
-**Key differences from the original:**
-- UFW-only firewall management (iptables and firewalld removed)
-- Automatic firewalld detection and disabling
-- Enhanced UFW installation and configuration
-- Improved error handling and service enablement
-- Streamlined for UFW-based systems
-
-Special thanks to angristan for providing the original idea, code structure, and inspiration for this project!
-
-## 📄 License
-
-This project maintains the same license as the original [wireguard-install](https://github.com/angristan/wireguard-install) project.
-
-## 🤝 Contributing
-
-Contributions, issues, and feature requests are welcome! Feel free to check the issues page.
-
-## 📞 Support
-
-If you encounter any problems:
-
-1. Check the [Troubleshooting](#-troubleshooting) section
-2. Review the [WireGuard documentation](https://www.wireguard.com/)
-3. Check UFW logs: `sudo journalctl -u ufw`
-4. Open an issue on GitHub
-
-## ⭐ Show Your Support
-
-If this project helped you, please consider giving it a star on GitHub!
-
----
-
-**Made with ❤️ for the VPN community**
+Issues and proposed improvements are welcome through this repository's [Issues](https://github.com/neosmith20/wireguard-install/issues) page. Please include the distribution/version, WireGuard mode, UFW status, a redacted log, and exact steps to reproduce. **Never post private keys, preshared keys, or complete client configs.**
