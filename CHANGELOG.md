@@ -1,102 +1,84 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+Notable changes to the WireGuard + UFW installer. These are **script revision milestones**; they do not imply that corresponding GitHub Releases or tags have been published. The current main-branch script identifies itself as **v7.0**, a multi-distribution review candidate.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [1.0.0] - 2025-01-04
-
-### Added
-- **New `disableFirewalld()` function**: Automatically detects and disables firewalld to prevent conflicts with UFW
-  - Stops firewalld service
-  - Disables firewalld from starting on boot
-  - Masks firewalld service to prevent accidental re-enabling
-  
-- **New `installUfw()` function**: Robust UFW installation with comprehensive error handling
-  - Checks if UFW is already installed
-  - Installs UFW based on detected Linux distribution
-  - Includes EPEL repository setup for RHEL-based systems (CentOS, AlmaLinux, Rocky Linux)
-  - Verifies successful installation before proceeding
-  - Exits with clear error messages if installation fails
-
-- **Enhanced `applyUfw()` function**: Complete rewrite of firewall configuration
-  - Sets proper default policies (deny incoming, allow outgoing, allow routed)
-  - Explicitly allows SSH (port 22/tcp) to prevent lockouts
-  - Configures UFW forwarding policies in `/etc/default/ufw`
-  - Enables IP forwarding for both IPv4 and IPv6 in `/etc/ufw/sysctl.conf`
-  - Creates backup of `/etc/ufw/before.rules` before modifications
-  - Intelligently adds NAT MASQUERADE rules to `before.rules`
-  - Adds routing rules between WireGuard and public interfaces
-  - Enables UFW service via systemd (or rc-service for Alpine)
-  - Displays UFW status after configuration
-
-- **Better status messages**: Color-coded output for installation steps and warnings
-
-- **Service enablement**: Ensures UFW service starts on boot across all supported distributions
+## Documentation update (after v7.0)
 
 ### Changed
-- **Removed all iptables commands**: Script now uses UFW exclusively for all firewall operations
-- **Removed firewalld branch**: Eliminated the conditional firewalld configuration path entirely
-- **Updated installation flow**: 
-  1. Checks for and disables firewalld first
-  2. Installs UFW if not present
-  3. Configures UFW before WireGuard setup
-  4. No PostUp/PostDown commands in WireGuard config (UFW handles everything)
+- Rewrote the README to describe the actual v7 prompts, paths, firewall policy, client behavior, supported-platform targets, and uninstall semantics.
+- Documented the difference between isolated IPv4 testing and still-unverified native kernel/systemd, IPv6, multi-distribution package, and firewalld integration tests.
+- Clarified why earlier installations must be removed with their matching installer version.
+- Replaced historical descriptions of default routed-ALLOW policy, files under `/root`, and an obsolete `/etc/wireguard/params` state file.
 
-- **Improved error handling**: Script now exits gracefully with clear messages if:
-  - UFW installation fails
-  - Required packages cannot be installed
-  - System is unsupported
+**Documentation only. No changes to the installer script.**
 
-- **Simplified WireGuard configuration**: Removed PostUp/PostDown iptables commands from `/etc/wireguard/wg0.conf` since UFW manages all firewall rules persistently
-
-- **Enhanced uninstall process**: Restores UFW `before.rules` backup if it exists during uninstallation
-
-### Removed
-- **All iptables direct manipulation**: No more raw iptables commands in PostUp/PostDown
-- **Firewalld detection and configuration**: Complete removal of firewalld-specific code paths
-- **Conditional firewall logic**: Script no longer checks `pgrep firewalld` to decide which firewall to use
+## 7.0 — Current review candidate
 
 ### Fixed
-- **Firewall conflicts**: Prevents UFW and firewalld from running simultaneously
-- **UFW not starting on boot**: Explicitly enables UFW service via systemd
-- **Missing UFW on non-Ubuntu systems**: Installs UFW automatically on Debian, Fedora, CentOS, etc.
-- **Incomplete NAT configuration**: Ensures MASQUERADE rules are properly added to UFW's before.rules
-- **IP forwarding not persisting**: Configures forwarding in both UFW and system sysctl files
+- Tagged IPv4 and IPv6 UFW NAT masquerade rules with installer-specific iptables comments.
+- Changed live NAT validation and cleanup to match only installer-owned tagged rules, preserving otherwise identical administrator rules.
+- Avoided adding an unnecessary blank line before an appended UFW NAT section and restored existing NAT files byte-for-byte in the tested layouts.
+- Kept live cleanup compatible with repeated UFW reloads that create duplicate tagged NAT entries.
 
-### Security
-- **SSH protection**: Explicitly allows SSH before enabling UFW to prevent accidental lockouts
-- **Maintains pre-shared keys**: Continues using pre-shared keys for all client connections
-- **Proper file permissions**: Keeps strict 600 permissions on `/etc/wireguard/` directory
+### Compatibility
+- Installer state format remains schema `4`, but v7's cleanup **cannot identify untagged NAT rules** created by v6.1 or older. Use the original installer version when uninstalling an earlier installation.
 
-## Differences from Original (angristan/wireguard-install)
+## 6.1 — IPv4 connectivity and cleanup
 
-This fork is specifically designed for users who prefer or require UFW as their firewall solution. Key philosophical differences:
+### Fixed
+- Added DNS resolver `/32` routes to generated split-tunnel clients when resolvers were outside their existing `AllowedIPs`; avoids explicitly routing an endpoint IP into the tunnel.
+- Removed remaining live masquerade entries on uninstall and failed-install rollback after UFW reloads.
+- Avoided accumulating an extra blank line in common `before.rules` install/uninstall cycles.
 
-| Feature | Original (angristan) | This Fork (UFW Edition) |
-|---------|---------------------|------------------------|
-| **Firewall Support** | iptables, firewalld, or UFW | UFW only |
-| **Firewall Selection** | Detects and uses available firewall | Always uses UFW, disables others |
-| **Installation** | Assumes firewall is present | Installs UFW if missing |
-| **Configuration Method** | PostUp/PostDown in WireGuard config | Persistent UFW rules |
-| **Conflict Handling** | May have conflicts if multiple firewalls exist | Automatically resolves conflicts |
+### Validation
+- Real IPv4 tunnel handshakes, forwarding, DNS behavior, access restrictions, client add/revoke, uninstall, and rollback were exercised in a disposable Ubuntu 24.04 environment using userspace WireGuard and a test systemd stand-in.
 
-## Version History
+## 6.0 — Arch compatibility
 
-### [1.0.0] - 2025-01-04
-- Initial release of UFW-only edition
-- Fork from angristan/wireguard-install
-- Complete firewall management overhaul
+### Fixed
+- Handled `/etc/os-release` files with no `VERSION_ID` (notably Arch Linux), rather than failing under `set -u`.
+- Included Arch's `procps-ng` dependency for `sysctl` on minimal installations.
 
----
+## 5.0 — Installation robustness
 
-## Contributing
+### Fixed
+- Checked for matching kernel headers when falling back to legacy WireGuard/DKMS installation on older Debian/Ubuntu kernels.
+- Skipped the private-LAN DNS exception prompt for DNS served directly by the WireGuard host.
+- Identified outdated installer state before validating keys introduced in later versions.
+- Reworked the firewalld-to-UFW handoff to enable UFW first, then stop firewalld, reload UFW, and verify NAT; rollback attempts to restore firewalld first.
+- Tightened variable scoping and removed unsupported version-specific comments.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for ways to get started.
+## 4.0 — IPv6 rule ordering and firewall safeguards
 
-## Acknowledgments
+### Fixed
+- Used UFW `prepend` rather than inserting IPv6 rules at a potentially invalid numbered position.
+- Improved saved-state validation, cleanup safeguards, and explicit confirmations when enabling host-wide UFW IPv6 filtering.
+- Added more explicit choices for access to host services and restricted private DNS.
 
-Original script and concept by [angristan](https://github.com/angristan/wireguard-install)
+## 3.0 — Multi-distribution candidate
 
-[1.0.0]: https://github.com/neosmith20/wireguard-install/releases/tag/v1.0.0
+### Added
+- Package-manager paths for APT, DNF, Pacman, and APK and OpenRC handling for Alpine.
+- Distribution-specific preflights and handling for existing firewalld configurations.
+- Sequential client host addresses inside the random first-install subnet.
+- Scoped private-network/cloud-metadata blocking and improved rollback handling.
+
+## 2.0 — Initial UFW rewrite
+
+### Added
+- First-install randomized, collision-checked `10.x.y.0/24` VPN networks.
+- More restrictive UFW forwarding rules, IPv4 NAT, client configuration permissions, and installation safety checks.
+- Client add/list/revoke management and QR enrollment.
+
+## 1.0.0 — 2025-01-04 (historical)
+
+- Initial UFW-oriented derivative of [angristan/wireguard-install](https://github.com/angristan/wireguard-install).
+- The early implementation's configuration paths, firewall defaults, and cleanup behavior have since changed substantially. Refer to the v7 README for current behavior.
+
+## Known validation gaps
+
+Native kernel WireGuard and real service/reboot persistence, full-tunnel IPv6/NAT66 behavior, active firewalld replacement, and package installations on all targeted distributions require further end-to-end tests. Passing Bash syntax, ShellCheck, or shfmt is not evidence that every platform/network scenario works.
+
+## License and attribution
+
+The installer retains MIT licensing and upstream attribution to [angristan/wireguard-install](https://github.com/angristan/wireguard-install). See [LICENSE](LICENSE) and the source-file notices.
