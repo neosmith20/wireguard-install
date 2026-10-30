@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireGuard + UFW installer, v7.0 (multi-distribution review candidate)
+# WireGuard + UFW installer, v8.0 (multi-distribution review candidate)
 # Derivative work inspired by angristan/wireguard-install:
 # https://github.com/angristan/wireguard-install
 # Copyright (c) 2019 angristan
@@ -29,7 +29,7 @@
 # Alpine requires the wireguard-tools-openrc integration package; check availability in enabled repositories.
 # Existing v3 installer state is intentionally NOT migrated automatically.
 # Requires bash; on Alpine install bash before running this script.
-# Private client files are stored root-only in /etc/wireguard/clients.
+# Client .conf files are saved root-only next to this script (or /root if piped).
 set -Eeuo pipefail
 umask 077
 
@@ -156,15 +156,78 @@ restore_ufw_service_state() {
   fi
 }
 
-ask() { # ask VARIABLE LABEL DEFAULT
-  local var="$1" label="$2" default="$3" answer
-  read -r -p "${label} [${default}]: " answer || die 'Input ended.'
-  printf -v "$var" '%s' "${answer:-$default}"
+# Prompts work like angristan's installer: the default is pre-filled and can be
+# edited or accepted with Enter, and an invalid answer asks again instead of
+# quitting. Without a terminal (scripted input) the default is shown in brackets.
+prompt() { # VARIABLE LABEL DEFAULT [VALIDATOR] [ERROR_MESSAGE]
+  local _pv="$1" _pl="$2" _pd="$3" _pc="${4:-}" _pe="${5:-Invalid answer, please try again.}" _pa
+  while :; do
+    if [[ -t 0 ]]; then
+      read -r -e -i "$_pd" -p "${_pl}: " _pa || die 'Input ended.'
+    elif [[ -n "$_pd" ]]; then
+      read -r -p "${_pl} [${_pd}]: " _pa || die 'Input ended.'
+    else
+      read -r -p "${_pl}: " _pa || die 'Input ended.'
+    fi
+    # In a terminal the default is pre-filled, so an empty answer really is empty.
+    [[ -t 0 ]] || _pa="${_pa:-$_pd}"
+    if [[ -z "$_pc" ]] || "$_pc" "$_pa"; then
+      printf -v "$_pv" '%s' "$_pa"
+      return 0
+    fi
+    say "$_pe"
+  done
 }
-confirm_exact() {
-  local answer
-  read -r -p "$1 (type $2): " answer || die 'Input ended.'
-  [[ "$answer" == "$2" ]] || die 'Canceled; nothing further changed.'
+prompt_yn() { # VARIABLE LABEL DEFAULT(y|n) -> sets VARIABLE to yes or no
+  local _pv="$1" _pl="$2" _pd="$3" _pa
+  while :; do
+    if [[ -t 0 ]]; then
+      read -r -e -i "$_pd" -p "${_pl} [y/n]: " _pa || die 'Input ended.'
+    else
+      read -r -p "${_pl} [y/n]: " _pa || die 'Input ended.'
+    fi
+    _pa="${_pa:-$_pd}"
+    case "${_pa,,}" in
+      y | yes)
+        printf -v "$_pv" yes
+        return 0
+        ;;
+      n | no)
+        printf -v "$_pv" no
+        return 0
+        ;;
+    esac
+    say 'Please answer y or n.'
+  done
+}
+press_any_key() {
+  if [[ -t 0 ]]; then
+    read -n1 -r -s -p 'Press any key to continue...' || die 'Input ended.'
+  else
+    read -r -p 'Press any key to continue...' || die 'Input ended.'
+  fi
+  say ''
+}
+
+# Client .conf files go next to this script, like angristan's installer puts
+# them in the user's home folder. When the script is piped (curl | bash) there
+# is no script file, so fall back to the sudo user's home folder, then /root.
+client_output_dir() {
+  local source="${BASH_SOURCE[0]:-}" dir home
+  if [[ -n "$source" && -f "$source" && "$source" != /dev/* && "$source" != /proc/* ]]; then
+    dir=$(cd -- "$(dirname -- "$source")" && pwd -P) && [[ -d "$dir" ]] && {
+      printf '%s\n' "$dir"
+      return 0
+    }
+  fi
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then
+    home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    if [[ -n "$home" && -d "$home" ]]; then
+      printf '%s\n' "$home"
+      return 0
+    fi
+  fi
+  printf '/root\n'
 }
 
 ipv4_integer() { # prints unsigned integer; fail on invalid IPv4
@@ -248,6 +311,41 @@ valid_endpoint() {
 valid_iface() { [[ "$1" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,14}$ ]]; }
 valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
 valid_client_name() { [[ "$1" =~ ^[a-zA-Z0-9_-]{1,15}$ ]]; }
+# Answer checkers for the install questions (each returns true when valid).
+check_pub_if() { valid_iface "$1" && ip link show dev "$1" >/dev/null 2>&1; }
+check_wg_if() {
+  valid_iface "$1" && [[ "$1" != "$PUB_IF" ]] &&
+    [[ ! -e "$WG_DIR/$1.conf" && ! -L "$WG_DIR/$1.conf" && ! -e "/sys/class/net/$1" ]]
+}
+check_server4() { # 10.x.y.1 whose 10.x.y.0/24 is unused on this server
+  [[ "$1" =~ ^10\.[0-9]{1,3}\.[0-9]{1,3}\.1$ ]] && valid_10_24 "${1%1}0/24" && ! subnet_in_use "${1%1}0/24"
+}
+check_client_dns() {
+  ipv4_integer "$1" >/dev/null || return 1
+  [[ "$1" != 0.0.0.0 ]] || return 1
+  ! cidr_overlap "$1/32" 127.0.0.0/8 && ! cidr_overlap "$1/32" 169.254.0.0/16 && ! cidr_overlap "$1/32" 224.0.0.0/4
+}
+check_client_dns2() { [[ -z "$1" ]] || check_client_dns "$1"; }
+# AllowedIPs: IPv4 CIDRs, plus ::/0 (IPv6 is handled automatically, see install).
+allowed_ips_to_routes4() { # prints the IPv4 part; fails on anything unsupported
+  local item out=''
+  local -a arr
+  IFS=',' read -r -a arr <<<"$1"
+  for item in "${arr[@]}"; do
+    item="${item//[[:space:]]/}"
+    [[ -n "$item" ]] || continue
+    [[ "$item" == ::/0 ]] && continue
+    valid_cidr4 "$item" || return 1
+    out+="${out:+,}$item"
+  done
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
+}
+check_allowed_ips() { allowed_ips_to_routes4 "$1" >/dev/null; }
+check_new_client_name() {
+  valid_client_name "$1" && ! client_exists "$1"
+}
+
 valid_routes() {
   local item arr
   IFS=',' read -r -a arr <<<"$1"
@@ -320,6 +418,36 @@ dns_client_routes() { # ROUTES -> ROUTES plus uncovered DNS /32s
     say "Note: routing DNS server $dns through the tunnel so split-tunnel lookups work." >&2
     routes+=",$dns/32"
   done
+  printf '%s\n' "$routes"
+}
+
+# Split tunnels: a client allowed onto the LAN also needs the LAN in its own
+# AllowedIPs, or its LAN traffic never enters the tunnel. Add each private
+# network this server reaches through its public interface (its home LAN).
+lan_client_routes() { # ROUTES -> ROUTES plus uncovered private LAN networks
+  local routes="$1" net route covered private
+  local -a arr
+  while read -r net; do
+    valid_cidr4 "$net" || continue
+    [[ "$net" != 0.0.0.0/0 ]] || continue
+    private=no
+    for route in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+      if cidr_overlap "$net" "$route" && ((${net##*/} >= ${route##*/})); then private=yes; fi
+    done
+    [[ "$private" == yes ]] || continue
+    ! cidr_overlap "$net" "$SUBNET4" || continue
+    covered=no
+    IFS=',' read -r -a arr <<<"$routes"
+    for route in "${arr[@]}"; do
+      route="${route//[[:space:]]/}"
+      if cidr_overlap "$net" "$route" && ((${net##*/} >= ${route##*/})); then
+        covered=yes
+        break
+      fi
+    done
+    [[ "$covered" == no ]] || continue
+    routes+=",$net"
+  done < <(ip -4 route show dev "$PUB_IF" 2>/dev/null | awk '$1 ~ /\// {print $1}')
   printf '%s\n' "$routes"
 }
 
@@ -397,7 +525,7 @@ save_state() {
   local tmp
   tmp=$(mktemp "$WG_DIR/.state.XXXXXX")
   cat >"$tmp" <<STATE
-# WireGuard UFW installer v7 (state schema 4); root-owned; data only (never source this file)
+# WireGuard UFW installer v8 (state schema 4); root-owned; data only (never source this file)
 STATE_VERSION=4
 ALLOW_LAN=$ALLOW_LAN
 ALLOW_HOST=$ALLOW_HOST
@@ -835,10 +963,8 @@ write_sysctl() {
 }
 
 make_server_config() {
-  local priv pub
+  local priv
   priv=$(wg genkey)
-  pub=$(printf '%s\n' "$priv" | wg pubkey)
-  SERVER_PUBLIC_KEY="$pub"
   {
     say '[Interface]'
     say "Address = ${SERVER4}/24"
@@ -849,127 +975,101 @@ make_server_config() {
   chmod 600 "$WG_DIR/$IFACE.conf"
 }
 
-install_server() {
-  [[ ! -e "$STATE_FILE" && ! -e "$WG_DIR/params" ]] || die 'Existing WireGuard installer state detected; refusing to overwrite it.'
-  [[ ! -e "$SYSCTL_FILE" ]] || die "Refusing to overwrite an existing $SYSCTL_FILE"
-  say 'This installer will install distribution packages before making any firewall changes.'
-  confirm_exact 'Authorize prerequisite package installation' PACKAGES
-  install_packages
-  FIREWALLD_PREVIOUS_ACTIVE=no
-  if firewalld_active; then
-    FIREWALLD_PREVIOUS_ACTIVE=yes
-    warn 'firewalld is active. This installer uses UFW, not firewalld.'
-    warn 'Replacing the host firewall can interrupt other applications or SSH.'
-    say 'Current firewalld runtime zone/services/ports/rich-rules:'
-    firewall-cmd --list-all-zones || warn 'Unable to inspect current firewalld zones.'
-    say 'Persisted firewalld zone configuration (may differ from runtime):'
-    firewall-cmd --permanent --list-all-zones || warn 'Unable to inspect saved firewalld zones.'
-    warn 'ONLY UFW SSH protection and the WireGuard UDP port are created automatically.'
-    warn 'Manually migrate all other required allowed ports/services to UFW first.'
-    confirm_exact 'Confirm you reviewed firewalld rules and authorize replacement' REPLACE
-  fi
-  if { [[ "$INIT_SYSTEM" == systemd ]] && systemctl is-active --quiet nftables 2>/dev/null; } ||
-    { [[ "$INIT_SYSTEM" == openrc ]] && rc-service nftables status >/dev/null 2>&1; }; then
-    die 'The standalone nftables service is active. Review existing firewall ownership before using UFW.'
-  fi
-  local guess_net suggested_ip suggested_if suggested_ssh answer dns_item
+install_questions() {
+  local suggested_if suggested_ip guess_net server4 dns2 allowed answer
+  say 'Welcome to the WireGuard installer (UFW edition)!'
+  say 'Based on https://github.com/angristan/wireguard-install'
+  say ''
+  say 'I need to ask you a few questions before starting the setup.'
+  say 'You can keep the default options and just press enter if you are ok with them.'
+  say ''
   suggested_if=$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' | head -1)
-  [[ -n "$suggested_if" ]] || die 'No default IPv4 route. Configure connectivity before installation.'
-  ask PUB_IF 'Outgoing/public network interface' "$suggested_if"
-  if ! valid_iface "$PUB_IF" || ! ip link show dev "$PUB_IF" >/dev/null 2>&1; then
-    die 'Invalid or missing public interface.'
+  [[ -n "$suggested_if" ]] || die 'No default IPv4 route. Connect this server to the network first.'
+  suggested_ip=$(ip -o -4 addr show dev "$suggested_if" scope global | awk '{split($4,a,"/");print a[1];exit}')
+  if [[ -n "$suggested_ip" ]] && is_private_dns "$suggested_ip"; then
+    say "Note: $suggested_ip is a private address, so this server is probably behind a router."
+    say 'Enter your PUBLIC IP or a DNS name instead, and forward the WireGuard UDP port on your router.'
   fi
-  suggested_ip=$(ip -o -4 addr show dev "$PUB_IF" scope global | awk '{split($4,a,"/");print a[1];exit}')
-  [[ -n "$suggested_ip" ]] || die "No IPv4 address on $PUB_IF."
-  say 'Use the actual PUBLIC IPv4 address or DNS hostname clients will connect to.'
-  say 'If the server is behind a home router, you also need UDP port forwarding.'
-  ask ENDPOINT_HOST 'Client endpoint host/IP' "$suggested_ip"
-  valid_endpoint "$ENDPOINT_HOST" || die 'Invalid endpoint host/IP.'
-  ask IFACE 'WireGuard interface' wg0
-  valid_iface "$IFACE" || die 'Invalid WireGuard interface name.'
-  [[ "$IFACE" != "$PUB_IF" ]] || die 'Public and WireGuard interfaces must be different.'
-  local preexisting_rules
-  preexisting_rules=$(ufw show added 2>/dev/null) || die 'Cannot inspect existing UFW rules.'
-  if [[ "$preexisting_rules" == *"wgufw-$IFACE-"* ]]; then
-    die 'Existing UFW rules carry this installer interface label. Review them before a fresh installation.'
-  fi
-  [[ ! -e "$WG_DIR/$IFACE.conf" && ! -L "$WG_DIR/$IFACE.conf" && ! -e "/sys/class/net/$IFACE" ]] || die "Interface/config $IFACE exists; not overwriting it."
+  prompt ENDPOINT_HOST 'IPv4 or IPv6 public address' "$suggested_ip" valid_endpoint \
+    'Please enter an IP address or DNS name.'
+  prompt PUB_IF 'Public interface' "$suggested_if" check_pub_if \
+    'That network interface does not exist on this server.'
+  prompt IFACE 'WireGuard interface name' wg0 check_wg_if \
+    'Use up to 15 letters/numbers, different from the public interface and not already in use.'
+  # Random, collision-checked VPN network; only generated on this first run.
+  guess_net=$(pick_subnet) || die 'Unable to find a free 10.x.y.0/24 range; check existing routes.'
+  prompt server4 'Server WireGuard IPv4' "${guess_net%0/24}1" check_server4 \
+    'Use an address like 10.x.y.1 whose 10.x.y.0/24 network is not already used on this server.'
+  SUBNET4="${server4%1}0/24"
+  SERVER4="$server4"
   PORT=$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')
   PORT=$((49152 + PORT % 16384))
-  ask PORT 'WireGuard UDP port' "$PORT"
-  valid_port "$PORT" || die 'Invalid WireGuard UDP port.'
-  guess_net=$(pick_subnet) || die 'Unable to find a free 10.x.y.0/24 range; check existing routes.'
-  say "Random collision-checked VPN network: $guess_net"
-  ask SUBNET4 'Use subnet (must be 10.x.y.0/24)' "$guess_net"
-  valid_10_24 "$SUBNET4" || die 'Invalid 10.x.y.0/24 subnet.'
-  ! subnet_in_use "$SUBNET4" || die 'Subnet overlaps an existing route, address or WireGuard config.'
-  SERVER4="${SUBNET4%0/24}1"
-  ask DNS1 'Client DNS resolver #1 (IPv4)' 1.1.1.1
-  ipv4_integer "$DNS1" >/dev/null || die 'Invalid IPv4 DNS #1.'
-  ask DNS2 'Client DNS resolver #2 (IPv4)' 1.0.0.1
-  ipv4_integer "$DNS2" >/dev/null || die 'Invalid IPv4 DNS #2.'
-  for dns_item in "$DNS1" "$DNS2"; do
-    if cidr_overlap "$dns_item/32" 127.0.0.0/8 || cidr_overlap "$dns_item/32" 169.254.0.0/16 ||
-      [[ "$dns_item" == 0.0.0.0 ]] || cidr_overlap "$dns_item/32" 224.0.0.0/4; then
-      die "Unsafe/nonroutable client DNS IPv4 address: $dns_item"
-    fi
-  done
-  ask ROUTES4 'Client IPv4 AllowedIPs (comma-separated CIDRs)' '0.0.0.0/0'
-  valid_routes "$ROUTES4" || die 'Only IPv4 CIDRs, e.g. 0.0.0.0/0 or 10.0.0.0/8, are supported here.'
-  ask ALLOW_LAN 'Allow VPN clients to reach private LAN ranges? (yes/no)' no
-  [[ "$ALLOW_LAN" == yes || "$ALLOW_LAN" == no ]] || die 'Answer yes or no for LAN access.'
-  if [[ "$ALLOW_LAN" == yes ]]; then warn 'LAN access allowed if the server has a route and the destination can return traffic; apply separate LAN policy if needed.'; fi
-  ask ALLOW_HOST 'Allow VPN clients to reach services running on this server? (yes/no)' no
-  [[ "$ALLOW_HOST" == yes || "$ALLOW_HOST" == no ]] || die 'Answer yes or no for server access.'
-  if [[ "$ALLOW_HOST" == yes ]]; then warn 'Server access enabled; any listening service may be reachable from VPN clients.'; fi
-  ALLOW_DNS_ONLY=no
-  if [[ "$ALLOW_LAN" == no ]] && { needs_lan_dns_exception "$DNS1" || needs_lan_dns_exception "$DNS2"; }; then
-    warn 'A private LAN DNS resolver was specified, but general private-LAN access is denied.'
-    warn 'A DNS-only exception (TCP/UDP 53) may work if routing and return paths exist.'
-    ask ALLOW_DNS_ONLY 'Allow private DNS resolver(s) only on TCP/UDP 53? (yes/no)' yes
-    [[ "$ALLOW_DNS_ONLY" == yes || "$ALLOW_DNS_ONLY" == no ]] || die 'Answer yes or no for DNS-only access.'
-    [[ "$ALLOW_DNS_ONLY" == yes ]] || die 'Private DNS would be blocked; change DNS servers or allow a DNS-only exception.'
-  fi
-  if { is_host_dns "$DNS1" || is_host_dns "$DNS2"; } && [[ "$ALLOW_HOST" == no ]]; then
-    warn 'A DNS resolver address belongs to this server; only TCP/UDP 53 will be allowed to that host address.'
-  fi
+  prompt PORT 'Server WireGuard port [1-65535]' "$PORT" valid_port 'Please enter a port from 1 to 65535.'
+  prompt DNS1 'First DNS resolver to use for the clients' 1.1.1.1 check_client_dns \
+    'Please enter a usable IPv4 address, e.g. 1.1.1.1.'
+  prompt dns2 'Second DNS resolver to use for the clients (optional)' 1.0.0.1 check_client_dns2 \
+    'Please enter a usable IPv4 address, or leave it empty.'
+  DNS2="${dns2:-$DNS1}"
+  say ''
+  say 'WireGuard uses a parameter called AllowedIPs to determine what is routed over the VPN.'
+  prompt allowed 'Allowed IPs list for generated clients (leave default to route everything)' \
+    '0.0.0.0/0,::/0' check_allowed_ips 'Please enter IPv4 ranges like 0.0.0.0/0 or 192.168.1.0/24 (plus ::/0).'
+  ROUTES4=$(allowed_ips_to_routes4 "$allowed")
   IPV6_ENABLED=no
   PREFIX6=''
   if has_global_ipv6 "$PUB_IF"; then
-    ask answer 'Enable IPv6 through WireGuard? Uses IPv6 NAT66 (yes/no)' no
-    if [[ "$answer" == yes ]]; then
-      IPV6_ENABLED=yes
-    elif [[ "$answer" != no ]]; then die 'Answer yes or no.'; fi
-  else
-    say 'No suitable native global IPv6 default route detected.'
+    prompt_yn answer 'This server has IPv6. Give VPN clients IPv6 internet access too?' n
+    [[ "$answer" == no ]] || IPV6_ENABLED=yes
   fi
-  # If this is a full-tunnel IPv4 configuration, don't leave native client
-  # IPv6 internet traffic going around the VPN. Route it into wg and drop it
-  # unless the server explicitly enables working IPv6 egress above.
+  # Full tunnel without IPv6 internet: send client IPv6 into the tunnel and drop
+  # it there, so it cannot leak around the VPN.
   if [[ "$IPV6_ENABLED" == no && "$ROUTES4" == *'/0'* ]]; then
     [[ $(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 1) == 0 ]] ||
-      die 'Kernel IPv6 is disabled: cannot install IPv6 leak-blocking tunnel address.'
+      die 'Kernel IPv6 is disabled, so client IPv6 cannot be blocked inside the tunnel. Enable IPv6 in the kernel and rerun.'
     IPV6_ENABLED=block
-    say 'IPv6 safety mode: client IPv6 is tunneled and BLOCKED (not leaked outside VPN).'
   fi
   if [[ "$IPV6_ENABLED" != no ]]; then PREFIX6=$(random_ula_prefix); fi
-  if [[ "$IPV6_ENABLED" == no ]]; then
-    say 'Split-tunnel IPv4 mode: client IPv6 follows the normal client network.'
-  fi
-  suggested_ssh=$(ssh_ports)
-  [[ -n "$suggested_ssh" ]] || suggested_ssh=22
-  ask SSH_PORTS 'SSH TCP port(s) to protect in UFW (comma-separated)' "$suggested_ssh"
-  # Validate every SSH port before touching UFW.
-  local port_item arr
-  IFS=',' read -r -a arr <<<"$SSH_PORTS"
-  for port_item in "${arr[@]}"; do valid_port "${port_item//[[:space:]]/}" || die "Invalid SSH port: $port_item"; done
   say ''
-  say "Interface: $IFACE | Public: $PUB_IF | UDP: $PORT | Endpoint: $ENDPOINT_HOST"
-  say "VPN: $SUBNET4 | Server: $SERVER4 | DNS: $DNS1, $DNS2 | IPv6: $IPV6_ENABLED"
-  say "Access: private LAN=$ALLOW_LAN, VPN server=$ALLOW_HOST, DNS-only=$ALLOW_DNS_ONLY"
-  say 'The installer will install packages, adjust UFW, enable forwarding and start WireGuard.'
-  say 'Existing non-UFW firewall rules and any router port-forwarding must be managed separately.'
-  confirm_exact 'Proceed with installation' INSTALL
+  say 'Okay, that was all I needed. We are ready to setup your WireGuard server now.'
+  say 'You will be able to generate a client at the end of the installation.'
+  press_any_key
+}
+
+install_server() {
+  [[ ! -e "$STATE_FILE" && ! -e "$WG_DIR/params" ]] || die 'Existing WireGuard installer state detected; refusing to overwrite it.'
+  [[ ! -e "$SYSCTL_FILE" ]] || die "Refusing to overwrite an existing $SYSCTL_FILE"
+  if { [[ "$INIT_SYSTEM" == systemd ]] && systemctl is-active --quiet nftables 2>/dev/null; } ||
+    { [[ "$INIT_SYSTEM" == openrc ]] && rc-service nftables status >/dev/null 2>&1; }; then
+    die 'The standalone nftables service is active. Disable it (or remove its rules) before using UFW.'
+  fi
+  # VPN clients reach this server's services; other LAN devices are blocked
+  # unless allowed per client. DNS servers on the LAN are always reachable.
+  ALLOW_LAN=no
+  ALLOW_HOST=yes
+  install_questions
+  ALLOW_DNS_ONLY=no
+  if needs_lan_dns_exception "$DNS1" || needs_lan_dns_exception "$DNS2"; then
+    ALLOW_DNS_ONLY=yes
+  fi
+
+  install_packages
+  local preexisting_rules suggested_ssh port_item ssh_ok=yes
+  local -a arr
+  preexisting_rules=$(ufw show added 2>/dev/null) || die 'Cannot inspect existing UFW rules.'
+  if [[ "$preexisting_rules" == *"wgufw-$IFACE-"* ]]; then
+    die "UFW already has rules from an earlier $IFACE install. Remove them (ufw status numbered) and rerun."
+  fi
+  FIREWALLD_PREVIOUS_ACTIVE=no
+  if firewalld_active; then
+    FIREWALLD_PREVIOUS_ACTIVE=yes
+    warn 'firewalld is running. It will be turned off and replaced by UFW.'
+    warn "These firewalld openings will NOT carry over: services: $(firewall-cmd --list-services 2>/dev/null || echo unknown); ports: $(firewall-cmd --list-ports 2>/dev/null || echo unknown)"
+  fi
+  # SSH is detected and allowed automatically so enabling UFW cannot lock you out.
+  suggested_ssh=$(ssh_ports)
+  IFS=',' read -r -a arr <<<"${suggested_ssh:-22}"
+  for port_item in "${arr[@]}"; do valid_port "${port_item//[[:space:]]/}" || ssh_ok=no; done
+  if [[ "$ssh_ok" == yes && -n "$suggested_ssh" ]]; then SSH_PORTS="$suggested_ssh"; else SSH_PORTS=22; fi
 
   UFW_PREVIOUS_ACTIVE=no
   if ufw_active; then UFW_PREVIOUS_ACTIVE=yes; fi
@@ -979,29 +1079,20 @@ install_server() {
   UFW_IPV6_PREVIOUS=$(ufw_ipv6_value)
   UFW_IPV6_CHANGED=no
   if [[ "$IPV6_ENABLED" != no && "$UFW_IPV6_PREVIOUS" != yes ]]; then
-    warn "IPv6 safety mode needs UFW IPv6=yes; currently ${UFW_IPV6_PREVIOUS}."
-    warn 'This changes filtering for ALL host IPv6 services (including existing inbound IPv6 connections).'
-    warn 'Confirm existing IPv6 services are permitted in UFW before authorizing.'
-    if [[ "$UFW_PREVIOUS_ACTIVE" == yes ]]; then
-      confirm_exact 'Authorize enabling UFW IPv6 filtering for the entire server' ENABLE-IPV6
-    else
-      confirm_exact 'Authorize enabling IPv6 filtering when UFW starts' ENABLE-IPV6
-    fi
+    warn 'Turning on UFW IPv6 filtering for this server (needed to keep client IPv6 inside the VPN).'
     UFW_IPV6_CHANGED=yes
   fi
   if [[ "$UFW_PREVIOUS_ACTIVE" == yes && "$PREV_ROUTED_POLICY" != deny && "$PREV_ROUTED_POLICY" != reject ]]; then
-    warn "Active UFW routed policy is '$PREV_ROUTED_POLICY'. Setting it to deny may affect other forwarded networks."
-    confirm_exact 'Authorize changing the UFW default routed policy to deny' CHANGE
+    warn "UFW's default for forwarded traffic was '$PREV_ROUTED_POLICY'; changing it to deny so only the VPN rules forward."
   fi
   if [[ "$UFW_PREVIOUS_ACTIVE" == no ]]; then
-    warn 'UFW is currently INACTIVE. Enabling it can disconnect sessions not covered by firewall rules.'
-    confirm_exact 'Authorize enabling UFW (SSH ports above will be allowed first)' ENABLE
+    say "Enabling UFW. SSH port(s) $SSH_PORTS will be allowed first so you stay connected."
   fi
   PREV_IP_FORWARD=$(sysctl -n net.ipv4.ip_forward)
   PREV_IP6_FORWARD=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)
   PREV_ACCEPT_RA=$(sysctl -n "net.ipv6.conf.${PUB_IF}.accept_ra" 2>/dev/null || echo 0)
-  mkdir -p "$WG_DIR" "$WG_DIR/clients"
-  chmod 700 "$WG_DIR" "$WG_DIR/clients"
+  mkdir -p "$WG_DIR"
+  chmod 700 "$WG_DIR"
   BACKUP_DIR=$(mktemp -d /root/.wgufw-install-backup.XXXXXXXX)
   for file in /etc/ufw/before.rules /etc/ufw/before6.rules /etc/ufw/user.rules /etc/ufw/user6.rules /lib/ufw/user.rules /lib/ufw/user6.rules /var/lib/ufw/user.rules /var/lib/ufw/user6.rules /usr/lib/ufw/user.rules /usr/lib/ufw/user6.rules /etc/default/ufw /etc/ufw/ufw.conf /etc/ufw/sysctl.conf "$SYSCTL_FILE"; do backup_file "$file"; done
   ROLLBACK_ARMED=yes
@@ -1053,9 +1144,10 @@ install_server() {
   trap - EXIT INT TERM
   rm -rf -- "$BACKUP_DIR"
   say ''
-  say "Installed successfully. Server public key: $SERVER_PUBLIC_KEY"
-  say "UDP $PORT must be reachable at $ENDPOINT_HOST."
-  say "VPN subnet: $SUBNET4 (recorded in $STATE_FILE)"
+  say "WireGuard is installed and running. VPN network: $SUBNET4, UDP port $PORT."
+  if is_private_dns "$ENDPOINT_HOST" 2>/dev/null; then
+    say "Remember to forward UDP port $PORT on your router to this server."
+  fi
   say ''
   add_client
 }
@@ -1106,31 +1198,112 @@ sync_server_config() {
   rm -f "$stripped"
 }
 
+# Each client's peer block in the server config is wrapped in markers and
+# records where its .conf file was saved and whether it may reach the LAN:
+#   # BEGIN WG-UFW CLIENT name / # CLIENT-FILE path / # LAN-ACCESS yes|no
+client_names() {
+  awk '/^# BEGIN WG-UFW CLIENT / {print $5}' "$WG_DIR/$IFACE.conf"
+}
+client_exists() { # NAME: in the server config, or a file of that name already saved
+  grep -Fqx "# BEGIN WG-UFW CLIENT $1" "$WG_DIR/$IFACE.conf" ||
+    [[ -e "$CLIENT_DIR/${IFACE}-client-$1.conf" || -L "$CLIENT_DIR/${IFACE}-client-$1.conf" ]]
+}
+client_meta() { # NAME KEY -> value of "# KEY value" inside the client's block
+  awk -v begin="# BEGIN WG-UFW CLIENT $1" -v end="# END WG-UFW CLIENT $1" -v key="# $2 " '
+    $0 == begin {inblk=1; next} $0 == end {inblk=0}
+    inblk && index($0, key) == 1 {print substr($0, length(key) + 1); exit}
+  ' "$WG_DIR/$IFACE.conf"
+}
+client_addresses() { # NAME -> "IPv4 [IPv6]" from the client's server-side AllowedIPs
+  local allowed item ip4='' ip6=''
+  local -a arr
+  allowed=$(awk -v begin="# BEGIN WG-UFW CLIENT $1" -v end="# END WG-UFW CLIENT $1" '
+    $0 == begin {inblk=1; next} $0 == end {inblk=0}
+    inblk && /^AllowedIPs[[:space:]]*=/ {sub(/^[^=]*=/, ""); print; exit}
+  ' "$WG_DIR/$IFACE.conf")
+  IFS=',' read -r -a arr <<<"$allowed"
+  for item in "${arr[@]}"; do
+    item="${item//[[:space:]]/}"
+    case "$item" in
+      */32) ip4="${item%/32}" ;;
+      */128) ip6="${item%/128}" ;;
+    esac
+  done
+  printf '%s %s\n' "$ip4" "$ip6"
+}
+
+# Per-client LAN access. LAN ranges are blocked for every client by the install
+# rules; these prepended rules let one client through. Its route to the VPN
+# subnet stays denied (and sits on top), so clients still can't reach each other.
+client_lan_rules() { # add|delete NAME IPv4 [IPv6]
+  local action="$1" name="$2" ip4="$3" ip6="${4:-}" range comment="wgufw-$IFACE-lan-$2"
+  if [[ "$action" == add ]]; then
+    for range in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
+      ufw route prepend allow in on "$IFACE" from "$ip4" to "$range" comment "$comment" || return 1
+    done
+    ufw route prepend deny in on "$IFACE" from "$ip4" to "$SUBNET4" comment "$comment" || return 1
+    if [[ "$IPV6_ENABLED" == yes && -n "$ip6" ]]; then
+      ufw route prepend allow in on "$IFACE" from "$ip6" to fc00::/7 comment "$comment" || return 1
+      ufw route prepend deny in on "$IFACE" from "$ip6" to "${PREFIX6}::/64" comment "$comment" || return 1
+    fi
+  else
+    for range in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
+      ufw --force route delete allow in on "$IFACE" from "$ip4" to "$range" >/dev/null 2>&1 || :
+    done
+    ufw --force route delete deny in on "$IFACE" from "$ip4" to "$SUBNET4" >/dev/null 2>&1 || :
+    if [[ -n "$ip6" && -n "${PREFIX6:-}" ]]; then
+      ufw --force route delete allow in on "$IFACE" from "$ip6" to fc00::/7 >/dev/null 2>&1 || :
+      ufw --force route delete deny in on "$IFACE" from "$ip6" to "${PREFIX6}::/64" >/dev/null 2>&1 || :
+    fi
+  fi
+}
+
+# Delete a client's saved .conf, but only the file this installer wrote for it.
+remove_client_file() { # NAME [PATH recorded in its block]
+  local name="$1" path="${2:-}"
+  [[ -n "$path" ]] || path=$(client_meta "$name" CLIENT-FILE)
+  if [[ -z "$path" ]]; then path="$WG_DIR/clients/$name.conf"; fi # v7 and older
+  case "${path##*/}" in
+    "${IFACE}-client-${name}.conf" | "${name}.conf") ;;
+    *) return 0 ;;
+  esac
+  if [[ -f "$path" && ! -L "$path" ]]; then rm -f -- "$path"; fi
+}
+
 add_client() {
-  local name ip host clientpriv clientpub psk serverpub tmpbackup path endpoint_string routes peer_allowed
+  local name lan ip host clientpriv clientpub psk serverpub tmpbackup path endpoint_string routes peer_allowed mtu ip6=''
   command -v wg >/dev/null || die 'WireGuard tools missing.'
   ip link show dev "$IFACE" >/dev/null 2>&1 || die 'WireGuard interface is not up; fix the service first.'
-  ask name 'New client name (1–15 letters/numbers/_/-)' client1
-  valid_client_name "$name" || die 'Invalid client name.'
-  path="$WG_DIR/clients/$name.conf"
-  [[ ! -e "$path" && ! -L "$path" ]] || die "Client $name already exists."
-  ! grep -Fqx "# BEGIN WG-UFW CLIENT $name" "$WG_DIR/$IFACE.conf" || die "Client $name already exists."
+  say ''
+  say 'Client configuration'
+  say ''
+  say "The client name must consist of alphanumeric character(s). It may also include underscores or dashes and can't exceed 15 chars."
+  prompt name 'Client name' '' check_new_client_name \
+    'That name is not allowed or is already used. Please choose another name.'
+  prompt_yn lan "Allow $name to reach devices on your home network (LAN)?" n
   read -r ip host < <(next_client_ip) || die 'No unused client IPv4 addresses remain.'
   [[ -n "$ip" ]] || die 'No unused client IPv4 addresses remain.'
+  if [[ "$IPV6_ENABLED" != no ]]; then ip6="${PREFIX6}::$(printf '%x' "$host")"; fi
   clientpriv=$(wg genkey)
   clientpub=$(printf '%s\n' "$clientpriv" | wg pubkey)
   psk=$(wg genpsk)
   serverpub=$(read_server_public_key) || die 'Cannot determine server public key.'
   endpoint_string="$ENDPOINT_HOST"
   if [[ "$endpoint_string" == *:* ]]; then endpoint_string="[$endpoint_string]"; fi
-  routes=$(dns_client_routes "$ROUTES4")
+  routes="$ROUTES4"
+  if [[ "$lan" == yes ]]; then routes=$(lan_client_routes "$routes"); fi
+  routes=$(dns_client_routes "$routes")
   if [[ "$IPV6_ENABLED" != no ]]; then routes="${routes}, ::/0"; fi
+  path="$CLIENT_DIR/${IFACE}-client-${name}.conf"
+  mtu=$(server_mtu)
+  [[ -z "$mtu" || "$mtu" =~ ^[0-9]+$ ]] || mtu=''
   {
     say '[Interface]'
     say "PrivateKey = $clientpriv"
     say "Address = $ip/32"
-    if [[ "$IPV6_ENABLED" != no ]]; then say "Address = ${PREFIX6}::$(printf '%x' "$host")/128"; fi
+    if [[ -n "$ip6" ]]; then say "Address = ${ip6}/128"; fi
     say "DNS = $DNS1, $DNS2"
+    if [[ -n "$mtu" ]]; then say "MTU = $mtu"; fi
     say ''
     say '[Peer]'
     say "PublicKey = $serverpub"
@@ -1143,10 +1316,12 @@ add_client() {
   tmpbackup=$(mktemp "$WG_DIR/.wg-backup.XXXXXX")
   cp -a "$WG_DIR/$IFACE.conf" "$tmpbackup"
   peer_allowed="$ip/32"
-  if [[ "$IPV6_ENABLED" != no ]]; then peer_allowed+=", ${PREFIX6}::$(printf '%x' "$host")/128"; fi
+  if [[ -n "$ip6" ]]; then peer_allowed+=", ${ip6}/128"; fi
   {
     say ''
     say "# BEGIN WG-UFW CLIENT $name"
+    say "# CLIENT-FILE $path"
+    say "# LAN-ACCESS $lan"
     say '[Peer]'
     say "PublicKey = $clientpub"
     say "PresharedKey = $psk"
@@ -1160,35 +1335,59 @@ add_client() {
     rm -f "$path"
     die 'Failed to activate new peer; server config restored.'
   fi
-  rm -f "$tmpbackup"
-  say "Client $name created: $ip | configuration: $path (root-readable only)"
-  if command -v qrencode >/dev/null; then
-    say 'Scan this WireGuard QR code on the client device:'
-    qrencode -t ansiutf8 -l L <"$path" || warn 'QR output failed; client file was created.'
+  if [[ "$lan" == yes ]] && ! client_lan_rules add "$name" "$ip" "$ip6" >/dev/null; then
+    client_lan_rules delete "$name" "$ip" "$ip6"
+    mv -f "$tmpbackup" "$WG_DIR/$IFACE.conf"
+    sync_server_config || warn 'Could not restore the previous running peer configuration.'
+    rm -f "$path"
+    die 'Failed to add the LAN access rules; client not created.'
   fi
-  say 'Keep client .conf files private; they contain keys.'
+  rm -f "$tmpbackup"
+  if command -v qrencode >/dev/null; then
+    say ''
+    say 'Here is your client config file as a QR Code:'
+    qrencode -t ansiutf8 -l L <"$path" || warn 'QR output failed; the client file was still created.'
+    say ''
+  fi
+  say "Your client config file is in $path"
+  if [[ "$lan" == yes ]]; then say "$name can reach your LAN."; else say "$name can reach the internet and this server, but not your LAN."; fi
 }
 
 list_clients() {
-  local any=0 name
-  say 'Clients:'
-  for name in "$WG_DIR"/clients/*.conf; do
-    [[ -e "$name" ]] || continue
-    any=1
-    printf '  %s\n' "${name##*/}"
-  done
-  ((any == 1)) || say '  (none)'
+  local names
+  names=$(client_names)
+  if [[ -z "$names" ]]; then
+    say ''
+    say 'You have no existing clients!'
+    return 0
+  fi
+  printf '%s\n' "$names" | nl -s ') '
 }
 
+check_client_number() { [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= CLIENT_COUNT)); }
+
 revoke_client() {
-  local name path backup tmp
-  list_clients
-  ask name 'Client name to revoke' ''
-  valid_client_name "$name" || die 'Invalid name.'
-  path="$WG_DIR/clients/$name.conf"
-  [[ -f "$path" ]] || die 'Client does not exist.'
-  grep -Fqx "# BEGIN WG-UFW CLIENT $name" "$WG_DIR/$IFACE.conf" || die 'Server peer marker not found; not touching config.'
-  confirm_exact "Remove client $name (revocation cannot be undone)" REVOKE
+  local names number name lan ip4 ip6 backup tmp client_file
+  names=$(client_names)
+  if [[ -z "$names" ]]; then
+    say ''
+    say 'You have no existing clients!'
+    exit 1
+  fi
+  CLIENT_COUNT=$(printf '%s\n' "$names" | wc -l)
+  say ''
+  say 'Select the existing client you want to revoke'
+  printf '%s\n' "$names" | nl -s ') '
+  if ((CLIENT_COUNT == 1)); then
+    prompt number 'Select one client [1]' '' check_client_number 'Please enter 1.'
+  else
+    prompt number "Select one client [1-$CLIENT_COUNT]" '' check_client_number "Please enter a number from 1 to $CLIENT_COUNT."
+  fi
+  name=$(printf '%s\n' "$names" | sed -n "$((10#$number))p")
+  valid_client_name "$name" || die 'Invalid client entry in the server config.'
+  lan=$(client_meta "$name" LAN-ACCESS)
+  client_file=$(client_meta "$name" CLIENT-FILE)
+  read -r ip4 ip6 < <(client_addresses "$name")
   backup=$(mktemp "$WG_DIR/.wg-backup.XXXXXX")
   cp -a "$WG_DIR/$IFACE.conf" "$backup"
   tmp=$(mktemp "$WG_DIR/.wg-new.XXXXXX")
@@ -1202,8 +1401,10 @@ revoke_client() {
     sync_server_config || warn 'Could not restore the previous running peer configuration.'
     die 'Peer synchronization failed; server config restored.'
   fi
-  rm -f "$backup" "$path"
-  say "Revoked $name. Any copies of its client .conf must also be deleted manually."
+  rm -f "$backup"
+  remove_client_file "$name" "$client_file"
+  if [[ "$lan" == yes && -n "$ip4" ]]; then client_lan_rules delete "$name" "$ip4" "$ip6"; fi
+  say "Client $name revoked."
 }
 
 ufw_rule_owned() {
@@ -1253,11 +1454,26 @@ remove_ufw_rules_by_comment() {
 }
 
 remove_server() {
-  warn 'This stops WireGuard and removes installer-owned WireGuard configs/NAT/port rules.'
-  warn 'UFW is left enabled; SSH safety rules from a first-time UFW activation are retained.'
-  warn 'Other host firewall rules and current kernel forwarding settings stay unchanged.'
-  confirm_exact "Remove $IFACE and its managed clients" UNINSTALL
+  local remove name lan ip4 ip6
+  say ''
+  warn 'This will uninstall WireGuard and remove all the configuration files!'
+  say "Please backup the $WG_DIR directory and your client files if you want to keep your configuration files."
+  say ''
+  prompt_yn remove 'Do you really want to remove WireGuard?' n
+  if [[ "$remove" != yes ]]; then
+    say ''
+    say 'Removal aborted!'
+    return 0
+  fi
   service_stop
+  # Per-client LAN rules and saved client files, recorded in each peer block.
+  while IFS= read -r name; do
+    if [[ -z "$name" ]] || ! valid_client_name "$name"; then continue; fi
+    lan=$(client_meta "$name" LAN-ACCESS)
+    read -r ip4 ip6 < <(client_addresses "$name")
+    if [[ "$lan" == yes && -n "$ip4" ]]; then client_lan_rules delete "$name" "$ip4" "$ip6"; fi
+    remove_client_file "$name"
+  done < <(client_names)
   remove_ufw_rules_by_comment
   remove_nat_block /etc/ufw/before.rules "$IFACE-v4"
   if [[ "$IPV6_ENABLED" == yes ]]; then remove_nat_block /etc/ufw/before6.rules "$IFACE-v6"; fi
@@ -1274,35 +1490,24 @@ remove_server() {
     current_ra=$(sysctl -n "net.ipv6.conf.${PUB_IF}.accept_ra" 2>/dev/null || :)
     if [[ "$current_ra" == 2 ]]; then
       sysctl -q -w "net.ipv6.conf.${PUB_IF}.accept_ra=$PREV_ACCEPT_RA" || warn 'Could not restore original IPv6 RA setting.'
-    else
-      warn 'IPv6 RA setting changed since installation; leaving its runtime value untouched.'
     fi
   fi
-  # Restoring IPv6=no globally is dangerous: user must explicitly approve.
+  # Put UFW's IPv6 setting back the way it was before this installer changed it.
   if [[ "$UFW_IPV6_CHANGED" == yes && "$UFW_IPV6_PREVIOUS" != yes && "$(ufw_ipv6_value)" == yes ]]; then
-    warn "This installation originally changed UFW IPV6=${UFW_IPV6_PREVIOUS} to yes."
-    warn 'Restoring the prior global setting could expose services over IPv6.'
-    local restore_ipv6_answer
-    ask restore_ipv6_answer 'Restore original global UFW IPv6 setting? (yes/no)' no
-    if [[ "$restore_ipv6_answer" == yes ]]; then
-      if [[ "$UFW_IPV6_PREVIOUS" == no ]]; then
-        sed -i -E 's/^[[:space:]]*IPV6[[:space:]]*=.*/IPV6=no/' /etc/default/ufw
-      else
-        sed -i -E '/^[[:space:]]*IPV6[[:space:]]*=/d' /etc/default/ufw
-      fi
-      ufw --force reload || warn 'UFW IPv6 setting changed but reload failed; inspect manually.'
+    if [[ "$UFW_IPV6_PREVIOUS" == no ]]; then
+      sed -i -E 's/^[[:space:]]*IPV6[[:space:]]*=.*/IPV6=no/' /etc/default/ufw
+    else
+      sed -i -E '/^[[:space:]]*IPV6[[:space:]]*=/d' /etc/default/ufw
     fi
+    ufw --force reload || warn 'UFW IPv6 setting restored but reload failed; check "ufw status".'
+    say "Restored UFW's original IPv6 setting."
   fi
   if [[ "${FIREWALLD_PREVIOUS_ACTIVE:-no}" == yes ]]; then
-    warn 'firewalld was active before installation; it has NOT been restored automatically.'
-    warn 'Before switching back, migrate services/ports and carefully plan which firewall is active.'
+    warn 'firewalld was running before installation and is still turned off; UFW stays in charge.'
   fi
-  # Do not reset kernel forwarding or global UFW settings: other networks may rely on them.
-  # No longer persist forwarding from this installer; reboot applies other system policy.
-  # Only remove clients whose names have this installer's server peer markers.
-  # A manually added file in clients/ must not be erased.
+  # Client files from v7 and older lived in /etc/wireguard/clients.
   local client_path client_name
-  for client_path in "$WG_DIR"/clients/*.conf; do
+  for client_path in /etc/wireguard/clients/*.conf; do
     [[ -f "$client_path" ]] || continue
     client_name="${client_path##*/}"
     client_name="${client_name%.conf}"
@@ -1310,29 +1515,182 @@ remove_server() {
       rm -f -- "$client_path"
     fi
   done
-  rmdir "$WG_DIR/clients" 2>/dev/null || warn 'Non-client files left in /etc/wireguard/clients; preserved.'
-  rm -f -- "$WG_DIR/$IFACE.conf" "$STATE_FILE"
-  say 'Removed WireGuard installation. UFW and system-wide forwarding policy were preserved.'
-  say 'Review global UFW IPv6/forwarding/default-routed policy; such settings may affect other services.'
+  rmdir /etc/wireguard/clients 2>/dev/null || :
+  remove_wire_seek
+  [[ -n "$IFACE" ]] || die 'Interface name missing; refusing to delete files.'
+  rm -f -- "/etc/wireguard/$IFACE.conf" "$STATE_FILE"
+  say ''
+  say 'WireGuard uninstalled successfully. UFW stays enabled (your SSH rule is kept).'
 }
+
+# ---- MTU finder: wire-seek (https://github.com/yeya/wire-seek, MIT) ----
+# Pinned release with built-in checksums: only this exact, verified build runs.
+readonly WIRE_SEEK_VERSION=v0.4.0
+readonly WIRE_SEEK_BIN=/usr/local/bin/wire-seek
+wire_seek_sha256() { # ARCH -> expected sha256 of the release binary
+  case "$1" in
+    amd64) printf '92fe0fd295fe09f8f08be11a2cff604f812892de76b044e6f7d36cb95059de9d\n' ;;
+    arm64) printf '4cd57b8305d6219fbeea01dfa32471c51fd68ce445fa54f2c16431dfa63f8bda\n' ;;
+    *) return 1 ;;
+  esac
+}
+wire_seek_arch() {
+  case "$(uname -m)" in
+    x86_64 | amd64) printf 'amd64\n' ;;
+    aarch64 | arm64) printf 'arm64\n' ;;
+    *) return 1 ;;
+  esac
+}
+wire_seek_ours() { # true if the installed binary is the pinned build
+  local arch
+  arch=$(wire_seek_arch) || return 1
+  [[ -f "$WIRE_SEEK_BIN" ]] && [[ "$(sha256sum "$WIRE_SEEK_BIN" | cut -d' ' -f1)" == "$(wire_seek_sha256 "$arch")" ]]
+}
+wire_seek_fail() { # TMPFILE MESSAGE
+  [[ -n "$1" && -f "$1" ]] && rm -f -- "$1"
+  warn "$2"
+  return 1
+}
+ensure_wire_seek() {
+  local arch expected tmp url
+  wire_seek_ours && return 0
+  if [[ -e "$WIRE_SEEK_BIN" ]]; then
+    warn "$WIRE_SEEK_BIN exists but is not wire-seek $WIRE_SEEK_VERSION; leaving it alone."
+    return 1
+  fi
+  arch=$(wire_seek_arch) || {
+    warn "wire-seek has no build for this CPU ($(uname -m)); it supports amd64 and arm64."
+    return 1
+  }
+  expected=$(wire_seek_sha256 "$arch")
+  if [[ "$DISTRO" == alpine ]]; then
+    # The release binary is built against glibc; Alpine needs the compatibility layer.
+    apk add gcompat >/dev/null || {
+      warn 'Could not install gcompat, which wire-seek needs on Alpine.'
+      return 1
+    }
+  fi
+  url="https://github.com/yeya/wire-seek/releases/download/${WIRE_SEEK_VERSION}/wire-seek-linux-${arch}"
+  tmp=$(mktemp /tmp/wire-seek.XXXXXX)
+  say "Downloading wire-seek $WIRE_SEEK_VERSION..."
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -o "$tmp" "$url" || wire_seek_fail "$tmp" 'Download failed. Check this server can reach github.com.' || return 1
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$tmp" "$url" || wire_seek_fail "$tmp" 'Download failed. Check this server can reach github.com.' || return 1
+  else
+    wire_seek_fail "$tmp" 'Neither curl nor wget is installed, so wire-seek cannot be downloaded.' || return 1
+  fi
+  if [[ "$(sha256sum "$tmp" | cut -d' ' -f1)" != "$expected" ]]; then
+    wire_seek_fail "$tmp" 'The downloaded wire-seek did not match its known checksum; it was deleted and NOT run.' || return 1
+  fi
+  install -m 755 "$tmp" "$WIRE_SEEK_BIN"
+  rm -f -- "$tmp"
+}
+remove_wire_seek() { if wire_seek_ours; then rm -f -- /usr/local/bin/wire-seek; fi; }
+
+server_mtu() { # prints the MTU set in the server config, if any
+  awk '/^\[Interface\]/ {i=1; next} /^\[/ {i=0} i && /^MTU[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$WG_DIR/$IFACE.conf"
+}
+set_conf_mtu() { # FILE MTU: set or add "MTU = N" in the [Interface] section
+  local file="$1" mtu="$2" tmp
+  tmp=$(mktemp "${file}.XXXXXX")
+  awk -v mtu="$mtu" '
+    /^\[Interface\]/ {print; i=1; next}
+    i && /^MTU[[:space:]]*=/ {next}
+    i && (/^\[/ || /^$/) && !done {print "MTU = " mtu; done=1; i=0}
+    {print}
+    END {if (i && !done) print "MTU = " mtu}
+  ' "$file" >"$tmp"
+  chmod --reference="$file" "$tmp"
+  chown --reference="$file" "$tmp"
+  mv -f "$tmp" "$file"
+}
+check_mtu_target() { valid_endpoint "$1"; }
+
+find_best_mtu() {
+  local target default_target='1.1.1.1' out mtu apply update name file count=0 endpoint pub
+  say ''
+  say 'wire-seek finds the best MTU (packet size) for the tunnel by testing the'
+  say 'network path from this server to a target. The best target is the public IP'
+  say "of one of your clients; 1.1.1.1 measures this server's own internet path."
+  ensure_wire_seek || return 0
+  # Offer a connected client's public IP as the default target.
+  while read -r pub endpoint; do
+    [[ "$endpoint" == "(none)" || -z "$endpoint" ]] && continue
+    name=$(awk -v key="$pub" '/^# BEGIN WG-UFW CLIENT / {n=$5} /^PublicKey[[:space:]]*=/ {v=$0; sub(/^[^=]*=[[:space:]]*/, "", v); if (v == key) {print n; exit}}' "$WG_DIR/$IFACE.conf")
+    endpoint="${endpoint%:*}"
+    endpoint="${endpoint#[}"
+    endpoint="${endpoint%]}"
+    say "  Connected client ${name:-?} is at $endpoint"
+    [[ "$default_target" == 1.1.1.1 ]] && default_target="$endpoint"
+  done < <(wg show "$IFACE" endpoints 2>/dev/null)
+  prompt target 'Target to test' "$default_target" check_mtu_target 'Please enter an IP address or DNS name.'
+  say ''
+  if ! out=$("$WIRE_SEEK_BIN" -max-mtu 1500 "$target" 2>&1); then
+    say "$out"
+    say ''
+    say 'wire-seek could not finish. The target may not answer pings; try 1.1.1.1 instead.'
+    return 0
+  fi
+  say "$out"
+  mtu=$(sed -n -E 's/^[[:space:]]*MTU = ([0-9]+)[[:space:]]*$/\1/p' <<<"$out" | tail -n1)
+  if [[ ! "$mtu" =~ ^[0-9]+$ ]] || ((mtu < 1280 || mtu > 1500)); then
+    say 'wire-seek did not report a usable MTU (WireGuard needs 1280-1500); nothing changed.'
+    return 0
+  fi
+  say ''
+  prompt_yn apply "Use MTU $mtu for this server and for new clients?" y
+  [[ "$apply" == yes ]] || return 0
+  set_conf_mtu "$WG_DIR/$IFACE.conf" "$mtu"
+  ip link set dev "$IFACE" mtu "$mtu" || warn 'Saved, but could not apply the MTU live; it applies on next restart.'
+  say "Server MTU set to $mtu. New clients will get MTU = $mtu."
+  while IFS= read -r name; do
+    file=$(client_meta "$name" CLIENT-FILE)
+    [[ -n "$file" && -f "$file" ]] && count=$((count + 1))
+  done < <(client_names)
+  if ((count > 0)); then
+    prompt_yn update "Also update your $count existing client file(s)?" y
+    if [[ "$update" == yes ]]; then
+      while IFS= read -r name; do
+        file=$(client_meta "$name" CLIENT-FILE)
+        [[ -n "$file" && -f "$file" ]] || continue
+        set_conf_mtu "$file" "$mtu"
+        say "  Updated $file"
+      done < <(client_names)
+      say 'Re-import each updated file (or re-scan its QR code) on its device for the change to take effect.'
+    fi
+  fi
+}
+
+check_menu_option() { [[ "$1" =~ ^[1-6]$ ]]; }
 
 main() {
   require_root
   require_os
   mkdir -p "$WG_DIR"
+  CLIENT_DIR=$(client_output_dir)
   if [[ -f "$STATE_FILE" ]]; then
     load_state
-    say "Managed WireGuard server: $IFACE | $SUBNET4 | port $PORT"
-    say '1) Add client   2) List clients   3) Revoke client   4) Uninstall   5) Exit'
     local option
-    ask option 'Select an option' 5
+    say 'Welcome to WireGuard-install (UFW edition)!'
+    say ''
+    say 'It looks like WireGuard is already installed.'
+    say ''
+    say 'What do you want to do?'
+    say '   1) Add a new user'
+    say '   2) List all users'
+    say '   3) Revoke existing user'
+    say '   4) Find the best MTU (wire-seek)'
+    say '   5) Uninstall WireGuard'
+    say '   6) Exit'
+    prompt option 'Select an option [1-6]' '' check_menu_option 'Please enter a number from 1 to 6.'
     case "$option" in
       1) add_client ;;
       2) list_clients ;;
       3) revoke_client ;;
-      4) remove_server ;;
-      5) exit 0 ;;
-      *) die 'Invalid option.' ;;
+      4) find_best_mtu ;;
+      5) remove_server ;;
+      6) exit 0 ;;
     esac
   else
     install_server
