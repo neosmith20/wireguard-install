@@ -153,6 +153,16 @@ If an installation fails, inspect the rollback output before disconnecting. The 
 
 The isolated test environment used test-only substitutions for the missing kernel WireGuard driver and systemd service. **Those substitutions are not part of the published installer.**
 
+## Releases
+
+New releases are published automatically by the [Release workflow](.github/workflows/release.yml). To publish one:
+
+1. Bump the version on **line 2** of `wireguard-install-ufw.sh` (e.g. `v8.1` → `v8.2`).
+2. Add a matching `## 8.2 — …` section at the top of `CHANGELOG.md`.
+3. Merge or push to `main`.
+
+The workflow runs the same Bash syntax, ShellCheck and shfmt checks, then creates tag `v8.2` and a release with the script and its `.sha256` checksum attached. The release notes are every `CHANGELOG.md` section since the previous release. Pushes that don't change the version are skipped, and an existing release is never overwritten.
+
 ## License and acknowledgments
 
 MIT licensed; see [LICENSE](LICENSE) and the copyright notices retained in the installer. This project is derived from and inspired by [angristan/wireguard-install](https://github.com/angristan/wireguard-install).
