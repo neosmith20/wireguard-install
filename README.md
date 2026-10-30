@@ -2,7 +2,7 @@
 
 A Bash installer for a WireGuard VPN server using **UFW (Uncomplicated Firewall)** to manage firewall policy and persistent NAT configuration. It supports interactive setup, client management, a randomized private VPN subnet, and safety checks for existing host firewalls.
 
-> **Project status: v7.0 review candidate.** IPv4 connectivity, client management, firewall isolation, uninstall, and rollback have been exercised in an isolated Ubuntu 24.04 userspace-WireGuard test network. Native kernel WireGuard, real systemd/OpenRC boot persistence, full-tunnel IPv6, firewalld replacement, and package installation across every targeted distribution have **not** all been verified. Test on a disposable VM with console access before using a remote production server.
+> **Project status: v8.0.** IPv4 connectivity, client management, firewall isolation, uninstall, and rollback have been exercised in an isolated Ubuntu 24.04 userspace-WireGuard test network. Native kernel WireGuard, real systemd/OpenRC boot persistence, full-tunnel IPv6, firewalld replacement, and package installation across every targeted distribution have **not** all been verified. Test on a disposable VM with console access before using a remote production server.
 
 ## Features
 
@@ -46,11 +46,10 @@ UFW owns the firewall configuration, but the script **does use `iptables`/`ip6ta
 ## Install
 
 Download and **review** the script before running it:
-
+*Assumption of running as root*
 ```bash
 wget https://raw.githubusercontent.com/neosmith20/wireguard-install/main/wireguard-install-ufw.sh
-less wireguard-install-ufw.sh
-sudo bash wireguard-install-ufw.sh
+./wireguard-install-ufw.sh
 ```
 
 The installer prompts for the outgoing interface, public endpoint address/hostname, WireGuard interface (default `wg0`), UDP port, first-run `10.x.y.0/24` subnet, two IPv4 DNS resolvers, client `AllowedIPs`, LAN and server-service access, IPv6 mode, and SSH protection.
@@ -70,16 +69,19 @@ The IPv6 paths have not received the same live end-to-end coverage as the IPv4 s
 After installation, the script offers to create the first client. Run the same script again for the management menu:
 
 ```bash
-sudo bash wireguard-install-ufw.sh
+./wireguard-install-ufw.sh
 ```
 
-| Option | Action |
-| --- | --- |
-| 1 | Add client |
-| 2 | List clients |
-| 3 | Revoke client (requires typing `REVOKE`) |
-| 4 | Uninstall this managed WireGuard server (requires typing `UNINSTALL`) |
-| 5 | Exit |
+## Menu
+
+Run the script again after installing to manage your server:
+
+1. **Add a new user**: creates a client config (saved next to the script) and shows a QR code; asks whether the client may reach your LAN
+2. **List all users**: shows every client
+3. **Revoke existing user**: pick a client by number to remove it
+4. **Find the best MTU (wire-seek)**: measures the network path and can apply the best MTU to the server and clients
+5. **Uninstall WireGuard**: removes WireGuard, its firewall rules, client files and wire-seek (asks `[y/n]` first)
+6. **Exit**
 
 - **Server config:** `/etc/wireguard/<interface>.conf` (e.g. `/etc/wireguard/wg0.conf`)
 - **Client configs:** `/etc/wireguard/clients/<name>.conf`
@@ -106,11 +108,11 @@ IPv4 NAT is stored in UFW's `before.rules`, tagged with an installer-specific co
 
 ## Uninstall and existing installations
 
-Use menu option **4** to stop the managed WireGuard service and remove its tracked peers, UFW rules, tagged NAT entries, configuration, and persistent forwarding file.
+Use menu option **5** to stop the managed WireGuard service and remove its tracked peers, UFW rules, tagged NAT entries, configuration, and persistent forwarding file.
 
 Uninstall **does not** automatically uninstall shared OS packages, disable UFW, remove SSH safety rules, restore firewalld, or reset all global firewall/forwarding policies; these may be used by other services. Review them yourself afterward. If the installer changed UFW's global IPv6 setting, restoring the earlier setting is offered separately with a warning.
 
-**Version compatibility:** v7 still uses installer state schema `4`, but v7's tagged NAT cleanup does **not** recognize the untagged NAT entries written by v6.1 and earlier. If you installed with v6.1 or an earlier revision, **uninstall with that same version first**, rather than assuming v7 will fully clean it up. v3 state is not automatically migrated.
+**Version compatibility:** v8 still uses installer state schema `4`, but v8's tagged NAT cleanup does **not** recognize the untagged NAT entries written by v6.1 and earlier. If you installed with v6.1 or an earlier revision, **uninstall with that same version first**, rather than assuming v8 will fully clean it up. v3 state is not automatically migrated.
 
 ## Troubleshooting
 
