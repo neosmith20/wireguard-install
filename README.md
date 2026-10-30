@@ -8,11 +8,13 @@ A Bash installer for a WireGuard VPN server using **UFW (Uncomplicated Firewall)
 
 - **Random subnet on first install:** chooses a collision-checked `10.x.y.0/24` network, records it, and assigns client IPs sequentially (starting at `.2`).
 - **UFW-managed firewall:** default-deny incoming/routed policies on new UFW setups, with explicit WireGuard transit rules.
-- **Protected destinations:** blocks VPN forwarding to `169.254.0.0/16` (including common cloud metadata addresses); private LAN and host-service access are denied by default, with explicit options.
-- **DNS handling:** accepts two IPv4 resolvers, can allow narrow TCP/UDP 53 exceptions for private resolvers, and adds required DNS host routes to split-tunnel client configs (without routing a matching endpoint IP into itself).
+- **Simple prompts (like angristan's):** pre-filled defaults you can accept with Enter or edit, invalid answers ask again, `[y/n]` questions, and "Press any key to continue" before installing.
+- **Protected destinations:** blocks VPN forwarding to `169.254.0.0/16` (including common cloud metadata addresses). VPN clients can reach services on the VPN server; private LAN access is blocked by default and chosen **per client** when the client is added. Clients can't reach each other.
+- **DNS handling:** accepts two IPv4 resolvers, automatically allows TCP/UDP 53 to private (LAN) resolvers, and adds required DNS host routes to split-tunnel client configs (without routing a matching endpoint IP into itself).
 - **IPv6 choices:** optional IPv6 egress using NAT66 on suitable hosts; for IPv4 full tunnels without IPv6 egress, attempts to route client IPv6 into the tunnel and block it. IPv6 behavior still needs native end-to-end testing.
-- **Client lifecycle:** add, list, and revoke peers; generate QR codes when `qrencode` is installed; synchronize peers without intentionally disrupting other clients.
-- **Safer changes:** SSH-port protection before activating previously inactive UFW, explicit confirmations, firewall snapshots and attempted rollback on installation failure.
+- **Client lifecycle:** add, list, and revoke (by number) peers; client configs are saved next to the script; generate QR codes when `qrencode` is installed; synchronize peers without intentionally disrupting other clients.
+- **MTU finder:** menu option to run [wire-seek](https://github.com/yeya/wire-seek) (pinned v0.4.0, checksum-verified) and apply the best MTU to the server and clients.
+- **Safer changes:** SSH port detected and allowed automatically before activating previously inactive UFW, firewall snapshots and attempted rollback on installation failure.
 - **Tagged NAT:** installer-owned masquerade rules are identified by comments, so cleanup can preserve an otherwise identical administrator-created rule.
 
 UFW owns the firewall configuration, but the script **does use `iptables`/`ip6tables`** to check and remove its *tagged live NAT entries*. It does not add WireGuard `PostUp`/`PostDown` firewall commands.
@@ -38,10 +40,10 @@ UFW owns the firewall configuration, but the script **does use `iptables`/`ip6ta
 - Use a **disposable VM or host with out-of-band/console access** for the first live test. Back up existing UFW and network settings.
 - You need root privileges, suitable package repositories, a working WireGuard kernel driver, and a network interface with IPv4 connectivity.
 - Ensure the selected UDP listening port is reachable externally, including router port forwarding or cloud-provider firewall rules as applicable.
-- Review SSH ports carefully. The installer detects an existing SSH connection or `sshd` configuration where possible and asks which TCP port(s) to protect.
-- If **firewalld** is active, the installer displays existing zones/services/ports, requires an explicit replacement confirmation, enables UFW first, and then disables firewalld. **It does not automatically migrate other allowed services.** Prepare equivalent UFW allowances before switching.
+- SSH is handled automatically: the installer detects your SSH port from the current connection or the `sshd` configuration (falling back to 22) and allows it before enabling UFW. If SSH runs on an unusual setup, check it afterward with `ufw status`.
+- If **firewalld** is active, the installer replaces it automatically: it prints a warning listing the firewalld services/ports that will **not** carry over, enables UFW first, and then disables firewalld. **It does not migrate other allowed services.** Prepare equivalent UFW allowances before switching.
 - The installer refuses to proceed while a separately managed `nftables` service is active.
-- Activating UFW or enabling IPv6 filtering can affect unrelated host services. The installer asks for confirmation but cannot guarantee against remote lockout.
+- Activating UFW or enabling IPv6 filtering can affect unrelated host services. The installer does this automatically with a printed warning and cannot guarantee against remote lockout.
 
 ## Install
 
@@ -49,12 +51,13 @@ Download and **review** the script before running it:
 *Assumption of running as root*
 ```bash
 wget https://raw.githubusercontent.com/neosmith20/wireguard-install/main/wireguard-install-ufw.sh
+chmod +x wireguard-install-ufw.sh
 ./wireguard-install-ufw.sh
 ```
 
-The installer prompts for the outgoing interface, public endpoint address/hostname, WireGuard interface (default `wg0`), UDP port, first-run `10.x.y.0/24` subnet, two IPv4 DNS resolvers, client `AllowedIPs`, LAN and server-service access, IPv6 mode, and SSH protection.
+The installer asks, in this order: public IPv4/IPv6 address or hostname, public interface, WireGuard interface name (default `wg0`), server WireGuard IPv4 (pre-filled with a random, collision-checked `10.x.y.1`), UDP port (random), two DNS resolvers, and client `AllowedIPs`. If the server has public IPv6, it also asks whether clients get IPv6 internet access. Then press any key and the rest is automatic.
 
-Default client IPv4 `AllowedIPs` is `0.0.0.0/0` (full tunnel). For a split tunnel, enter the intended IPv4 CIDRs instead. Private-LAN forwarding is blocked unless explicitly enabled; permitting LAN access also requires valid routes and a return path outside the installer.
+Default client `AllowedIPs` is `0.0.0.0/0,::/0` (full tunnel). For a split tunnel, enter the intended IPv4 CIDRs instead. Private-LAN forwarding is blocked unless allowed for a client when it is added; LAN-allowed split-tunnel clients get the server's LAN networks added to their routes automatically. LAN access also requires the LAN to have a return path to the server.
 
 ### IPv6 behavior
 
@@ -84,35 +87,36 @@ Run the script again after installing to manage your server:
 6. **Exit**
 
 - **Server config:** `/etc/wireguard/<interface>.conf` (e.g. `/etc/wireguard/wg0.conf`)
-- **Client configs:** `/etc/wireguard/clients/<name>.conf`
+- **Client configs:** saved next to the script as `<interface>-client-<name>.conf` (e.g. `/root/wg0-client-phone.conf`); if the script is piped (`curl | bash`), the sudo user's home folder or `/root`
 - **Installer state:** `/etc/wireguard/ufw-installer.state`
 - **Managed forwarding config:** `/etc/sysctl.d/99-z-wg-ufw-installer.conf`
 - **UFW NAT files:** `/etc/ufw/before.rules` and, if IPv6 NAT66 is enabled, `/etc/ufw/before6.rules`
 
-Installer-created client files contain **private keys and preshared keys** and are kept root-readable only. Treat QR codes as sensitive secrets as well. Securely transfer the config to the device; import it using a WireGuard-compatible client.
+Installer-created client files contain **private keys and preshared keys** and are kept root-readable only (`600`). Treat QR codes as sensitive secrets as well. Securely transfer the config to the device; import it using a WireGuard-compatible client.
 
 ## Firewall behavior
 
-On a newly enabled UFW installation, the installer sets **deny incoming**, **allow outgoing**, and **deny routed**, then applies scoped exceptions. On an already-active UFW installation, it preserves the existing incoming/outgoing defaults but may change an overly permissive routed default **after confirmation**.
+On a newly enabled UFW installation, the installer sets **deny incoming**, **allow outgoing**, and **deny routed**, then applies scoped exceptions. On an already-active UFW installation, it preserves the existing incoming/outgoing defaults but changes an overly permissive routed default to deny, with a printed warning.
 
 Typical installer-managed policy:
 
 - Allow the chosen WireGuard UDP listening port on the selected public interface.
 - Allow WireGuard-client forwarding through the specified outbound interface.
 - Deny routed traffic toward the cloud metadata/link-local IPv4 range.
-- Deny private IPv4 ranges (RFC1918 and CGNAT) unless LAN access is enabled; optionally permit selected private DNS resolvers on TCP/UDP 53 only.
-- Deny access from VPN clients to server-hosted services by default; optionally allow all host services or only configured host DNS (TCP/UDP 53).
+- Deny private IPv4 ranges (RFC1918 and CGNAT), except for clients given LAN access; private DNS resolvers are always permitted on TCP/UDP 53 only.
+- Deny traffic between VPN clients.
+- Allow VPN clients to reach services hosted on the VPN server.
 - Apply IPv6 forwarding, NAT66, or block rules according to the selected IPv6 mode.
 
-IPv4 NAT is stored in UFW's `before.rules`, tagged with an installer-specific comment. Because UFW reloads can duplicate live NAT entries, v7 removes **only its own tagged entries** on uninstall/rollback.
+IPv4 NAT is stored in UFW's `before.rules`, tagged with an installer-specific comment. Because UFW reloads can duplicate live NAT entries, the installer removes **only its own tagged entries** on uninstall/rollback.
 
 ## Uninstall and existing installations
 
-Use menu option **5** to stop the managed WireGuard service and remove its tracked peers, UFW rules, tagged NAT entries, configuration, and persistent forwarding file.
+Use menu option **5** (it asks `[y/n]` first) to stop the managed WireGuard service and remove its tracked peers, saved client files, per-client LAN rules, UFW rules, tagged NAT entries, configuration, persistent forwarding file, and wire-seek (if the installer downloaded it).
 
-Uninstall **does not** automatically uninstall shared OS packages, disable UFW, remove SSH safety rules, restore firewalld, or reset all global firewall/forwarding policies; these may be used by other services. Review them yourself afterward. If the installer changed UFW's global IPv6 setting, restoring the earlier setting is offered separately with a warning.
+Uninstall **does not** automatically uninstall shared OS packages, disable UFW, remove the SSH safety rule, restore firewalld, or reset all global firewall/forwarding policies; these may be used by other services. Review them yourself afterward. If the installer changed UFW's global IPv6 setting, uninstall restores the earlier setting automatically.
 
-**Version compatibility:** v8 still uses installer state schema `4`, but v8's tagged NAT cleanup does **not** recognize the untagged NAT entries written by v6.1 and earlier. If you installed with v6.1 or an earlier revision, **uninstall with that same version first**, rather than assuming v8 will fully clean it up. v3 state is not automatically migrated.
+**Version compatibility:** v8 still uses installer state schema `4`, so it can manage a v7 install (its client files in `/etc/wireguard/clients` are still cleaned up). v8's tagged NAT cleanup does **not** recognize the untagged NAT entries written by v6.1 and earlier. If you installed with v6.1 or an earlier revision, **uninstall with that same version first**, rather than assuming v8 will fully clean it up. v3 state is not automatically migrated.
 
 ## Troubleshooting
 
@@ -137,10 +141,12 @@ If an installation fails, inspect the rollback output before disconnecting. The 
 
 | Area | Status |
 | --- | --- |
-| ShellCheck, shfmt, Bash syntax | Reported clean for v7 during independent review |
+| ShellCheck, shfmt, Bash syntax | Clean for v8 (`shellcheck -S style`, `shfmt -i 2 -ci`, `bash -n`) |
 | IPv4 test tunnel, client handshake and NAT | Tested in disposable Ubuntu 24.04 environment with **userspace WireGuard** |
 | Private-LAN, cloud-metadata, host access and DNS exceptions | Tested in isolated network |
 | Client creation, revocation, uninstall and rollback | Tested in isolated network |
+| Per-client LAN access, client files next to the script | Tested in isolated network |
+| wire-seek download, checksum check and MTU apply | Tested in isolated network |
 | Native WireGuard kernel + real systemd services/reboot | **Not yet verified end to end** |
 | IPv6 full tunnel / NAT66 / leak-blocking | **Not yet verified end to end** |
 | Active firewalld replacement and package installs on other distros | **Not yet verified end to end** |
