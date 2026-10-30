@@ -2,7 +2,7 @@
 
 A Bash installer for a WireGuard VPN server using **UFW (Uncomplicated Firewall)** to manage firewall policy and persistent NAT configuration. It supports interactive setup, client management, a randomized private VPN subnet, and safety checks for existing host firewalls.
 
-> **Project status: v8.0.** IPv4 connectivity, client management, firewall isolation, uninstall, and rollback have been exercised in an isolated Ubuntu 24.04 userspace-WireGuard test network. Native kernel WireGuard, real systemd/OpenRC boot persistence, full-tunnel IPv6, firewalld replacement, and package installation across every targeted distribution have **not** all been verified. Test on a disposable VM with console access before using a remote production server.
+> **Project status: v8.1.** IPv4 connectivity, client management, firewall isolation, uninstall, and rollback have been exercised in an isolated Ubuntu 24.04 userspace-WireGuard test network. Native kernel WireGuard, real systemd/OpenRC boot persistence, full-tunnel IPv6, firewalld replacement, and package installation across every targeted distribution have **not** all been verified. Test on a disposable VM with console access before using a remote production server.
 
 ## Features
 
@@ -141,7 +141,7 @@ If an installation fails, inspect the rollback output before disconnecting. The 
 
 | Area | Status |
 | --- | --- |
-| ShellCheck, shfmt, Bash syntax | Clean for v8 (`shellcheck -S style`, `shfmt -i 2 -ci`, `bash -n`) |
+| ShellCheck, shfmt, Bash syntax | Clean for v8.1 (`shellcheck -S style` 0.9.0 and 0.11.0, `shfmt -i 2 -ci` 3.8.0 and 3.14.1, `bash -n`) |
 | IPv4 test tunnel, client handshake and NAT | Tested in disposable Ubuntu 24.04 environment with **userspace WireGuard** |
 | Private-LAN, cloud-metadata, host access and DNS exceptions | Tested in isolated network |
 | Client creation, revocation, uninstall and rollback | Tested in isolated network |
