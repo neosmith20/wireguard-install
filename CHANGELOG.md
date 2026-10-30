@@ -1,6 +1,45 @@
 # Changelog
 
-Notable changes to the WireGuard + UFW installer. These are **script revision milestones**; they do not imply that corresponding GitHub Releases or tags have been published. The current main-branch script identifies itself as **v7.0**, a multi-distribution review candidate.
+Notable changes to the WireGuard + UFW installer. These are **script revision milestones**; they do not imply that corresponding GitHub Releases or tags have been published. The current main-branch script identifies itself as **v8.1**, a multi-distribution review candidate.
+
+## 8.1 — ShellCheck 0.9.0 compatibility
+
+### Fixed
+- Rewrote four `A && B || :` lines as `if` statements so ShellCheck 0.9.0 (Ubuntu 24.04, used by the GitHub Actions check) passes. Newer ShellCheck releases no longer flag this pattern.
+
+**No behavior change.**
+
+## Documentation update (after v8.0)
+
+### Changed
+- Updated the README for v8: the install command now makes the script executable (`chmod +x`), and the prompts, client file location, per-client LAN access, server access, automatic SSH/firewalld/IPv6 handling, uninstall behavior and testing status match the v8 script.
+
+**Documentation only. No changes to the installer script.**
+
+## 8.0 — Simpler prompts, per-client LAN access, MTU finder
+
+### Changed
+- Prompts now work like [angristan/wireguard-install](https://github.com/angristan/wireguard-install): questions come first in the same order and wording, with pre-filled defaults you can accept with Enter or edit, and invalid answers ask again instead of quitting.
+- Yes/no questions take `y` or `n`; removed the typed `PACKAGES`, `INSTALL`, `ENABLE`, `CHANGE`, `REPLACE`, `ENABLE-IPV6`, `REVOKE` and `UNINSTALL` confirmations.
+- Packages install automatically after "Press any key to continue".
+- The SSH port is detected and allowed automatically before UFW is enabled (no SSH question).
+- firewalld replacement, an already-active UFW with a permissive routed default, and enabling UFW IPv6 filtering are handled automatically with a printed warning.
+- The random VPN subnet is offered as the pre-filled "Server WireGuard IPv4" answer (`10.x.y.1`).
+- VPN clients can reach services on the VPN server (no server-access question).
+- Client configs are saved next to the script as `<interface>-client-<name>.conf` (falls back to the sudo user's home or `/root` when piped).
+- Revoke a client by picking its number; uninstall asks a single `[y/n]`.
+- Uninstall restores UFW's original IPv6 setting automatically if the installer changed it.
+
+### Added
+- Per-client LAN access: LAN is blocked by default and chosen with a `[y/n]` when each client is added. LAN-allowed clients still can't reach other VPN clients.
+- LAN-allowed split-tunnel clients get the server's LAN networks added to their `AllowedIPs` automatically.
+- Menu option **4) Find the best MTU (wire-seek)**: runs [yeya/wire-seek](https://github.com/yeya/wire-seek), pinned to v0.4.0 with built-in SHA-256 checksums (amd64 and arm64; installs `gcompat` on Alpine). Applies the result to the server and new clients, and can update existing client files. Uninstall moved to option 5 and Exit to 6.
+
+### Compatibility
+- Installer state remains schema `4`, so v8 can manage a v7 installation; v7 client files in `/etc/wireguard/clients` are still cleaned up on revoke/uninstall.
+
+### Validation
+- Exercised in a disposable Ubuntu 24.04 environment with userspace WireGuard and a test systemd stand-in: re-asking on invalid answers, install, two real clients (with and without LAN access), server access, client isolation, LAN DNS, metadata blocking, revoke by number, wire-seek download/checksum rejection/MTU discovery/apply, uninstall cleanup, rollback, and an already-active UFW.
 
 ## Documentation update (after v7.0)
 
@@ -12,7 +51,7 @@ Notable changes to the WireGuard + UFW installer. These are **script revision mi
 
 **Documentation only. No changes to the installer script.**
 
-## 7.0 — Current review candidate
+## 7.0 — Tagged NAT cleanup
 
 ### Fixed
 - Tagged IPv4 and IPv6 UFW NAT masquerade rules with installer-specific iptables comments.
@@ -73,7 +112,7 @@ Notable changes to the WireGuard + UFW installer. These are **script revision mi
 ## 1.0.0 — 2025-01-04 (historical)
 
 - Initial UFW-oriented derivative of [angristan/wireguard-install](https://github.com/angristan/wireguard-install).
-- The early implementation's configuration paths, firewall defaults, and cleanup behavior have since changed substantially. Refer to the v7 README for current behavior.
+- The early implementation's configuration paths, firewall defaults, and cleanup behavior have since changed substantially. Refer to the README for current behavior.
 
 ## Known validation gaps
 
