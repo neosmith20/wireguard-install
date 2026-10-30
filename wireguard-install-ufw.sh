@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireGuard + UFW installer, v8.0 (multi-distribution review candidate)
+# WireGuard + UFW installer, v8.1 (multi-distribution review candidate)
 # Derivative work inspired by angristan/wireguard-install:
 # https://github.com/angristan/wireguard-install
 # Copyright (c) 2019 angristan
@@ -119,7 +119,7 @@ service_stop() {
   else
     rc-service "wg-quick.$IFACE" stop 2>/dev/null || :
     rc-update del "wg-quick.$IFACE" default 2>/dev/null || :
-    [[ -L "/etc/init.d/wg-quick.$IFACE" ]] && rm -f "/etc/init.d/wg-quick.$IFACE" || :
+    if [[ -L "/etc/init.d/wg-quick.$IFACE" ]]; then rm -f "/etc/init.d/wg-quick.$IFACE" || :; fi
   fi
 }
 firewalld_active() { [[ "$INIT_SYSTEM" == systemd ]] && systemctl is-active --quiet firewalld 2>/dev/null; }
@@ -525,7 +525,7 @@ save_state() {
   local tmp
   tmp=$(mktemp "$WG_DIR/.state.XXXXXX")
   cat >"$tmp" <<STATE
-# WireGuard UFW installer v8 (state schema 4); root-owned; data only (never source this file)
+# WireGuard UFW installer v8.1 (state schema 4); root-owned; data only (never source this file)
 STATE_VERSION=4
 ALLOW_LAN=$ALLOW_LAN
 ALLOW_HOST=$ALLOW_HOST
@@ -705,10 +705,10 @@ rollback_new_install() {
         remove_live_nat "$SUBNET4" || :
       fi
     fi
-    [[ -n "${PREV_IP_FORWARD:-}" ]] && sysctl -q -w "net.ipv4.ip_forward=$PREV_IP_FORWARD" || :
+    if [[ -n "${PREV_IP_FORWARD:-}" ]]; then sysctl -q -w "net.ipv4.ip_forward=$PREV_IP_FORWARD" || :; fi
     if [[ "${IPV6_ENABLED:-no}" == yes ]]; then
-      [[ -n "${PREV_IP6_FORWARD:-}" ]] && sysctl -q -w "net.ipv6.conf.all.forwarding=$PREV_IP6_FORWARD" || :
-      [[ -n "${PREV_ACCEPT_RA:-}" ]] && sysctl -q -w "net.ipv6.conf.${PUB_IF}.accept_ra=$PREV_ACCEPT_RA" || :
+      if [[ -n "${PREV_IP6_FORWARD:-}" ]]; then sysctl -q -w "net.ipv6.conf.all.forwarding=$PREV_IP6_FORWARD" || :; fi
+      if [[ -n "${PREV_ACCEPT_RA:-}" ]]; then sysctl -q -w "net.ipv6.conf.${PUB_IF}.accept_ra=$PREV_ACCEPT_RA" || :; fi
     fi
     restore_ufw_service_state
     rm -f -- "$STATE_FILE" "$WG_DIR/${IFACE:-wg0}.conf"
